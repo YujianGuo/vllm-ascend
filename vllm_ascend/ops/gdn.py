@@ -28,6 +28,7 @@ from fla_npu.ops.ascendc import (
 from torch import nn
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.model_executor.utils import replace_parameter
@@ -37,6 +38,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # typ
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend import envs
 from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
     wait_for_kv_layer_from_connector,
@@ -51,6 +53,8 @@ from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
 from vllm_ascend.utils import vllm_version_is
+
+logger = init_logger(__name__)
 
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
 
@@ -249,7 +253,15 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if cls._fused_chunk_available is not None:
             return cls._fused_chunk_available
 
+        if not envs.VLLM_ASCEND_ENABLE_GDN_FUSED_CHUNK:
+            cls._fused_chunk_available = False
+            return False
+
         if not hasattr(torch_npu, "npu_chunk_gated_delta_rule"):
+            logger.info(
+                "torch_npu.npu_chunk_gated_delta_rule not found, GDN prefill keeps "
+                "the Triton pipeline."
+            )
             cls._fused_chunk_available = False
             return False
 
@@ -281,7 +293,15 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             torch.npu.synchronize()
             cls._fused_chunk_available = True
-        except Exception:
+            logger.info(
+                "GDN prefill uses the fused operator torch_npu.npu_chunk_gated_delta_rule."
+            )
+        except Exception as exc:  # noqa: BLE001 - any failure must fall back
+            logger.warning(
+                "torch_npu.npu_chunk_gated_delta_rule smoke call failed (%s), "
+                "GDN prefill keeps the Triton pipeline.",
+                exc,
+            )
             cls._fused_chunk_available = False
         return cls._fused_chunk_available
 
@@ -292,6 +312,20 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if use_fla_gdn_prefill and _get_fla_gdn_prefill_op() is not None:
             return True
         return cls._probe_fused_chunk()
+
+    @staticmethod
+    def _fused_chunk_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+        """Per-call applicability check for the fused chunk GDN operator."""
+        if not (q.dtype == k.dtype == v.dtype == torch.bfloat16):
+            # The CANN operator only accepts bfloat16.
+            return False
+        if q.shape[-1] != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
+            return False
+        num_k_heads = k.shape[-2]
+        num_v_heads = v.shape[-2]
+        if num_k_heads <= 0 or num_v_heads <= 0 or num_v_heads % num_k_heads != 0:
+            return False
+        return num_k_heads <= 64 and num_v_heads <= 64
 
     @staticmethod
     def _chunk_gated_delta_rule_fused(
@@ -803,6 +837,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 and query_non_spec.device.type != "cpu"
                 and AscendGatedDeltaNetAttention._probe_fused_chunk()
                 and get_pcp_group().world_size == 1
+                and AscendGatedDeltaNetAttention._fused_chunk_supported(
+                    query_non_spec, key_non_spec, value_non_spec
+                )
             )
             if fla_gdn_prefill_op is not None:
                 initial_state = gather_ssm_states(
@@ -826,6 +863,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     prefill_state_indices,
                     last_recurrent_state.to(ssm_state.dtype).contiguous(),
                 )
+                if envs.VLLM_ASCEND_GDN_FUSED_CHUNK_DEBUG:
+                    logger.warning_once(
+                        "GDN fused chunk prefill hit: q=%s v=%s g=%s beta=%s",
+                        tuple(query_non_spec.shape),
+                        tuple(value_non_spec.shape),
+                        tuple(g_non_spec.shape),
+                        tuple(beta_non_spec.shape),
+                    )
             elif use_fused_chunk:
                 # Gather only the selected rows. Generic advanced indexing first
                 # materializes the complete cache when ssm_state has a padded
