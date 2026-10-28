@@ -204,6 +204,23 @@ def maybe_auto_detect_quantization(vllm_config) -> None:
         model,
     )
 
+    # The MTP draft model shares the target checkpoint, so it must be quantized
+    # the same way. vLLM propagates `--quantization` to the draft
+    # (SpeculativeConfig.__post_init__), but auto-detection runs afterwards and
+    # only touches the target model_config, leaving the draft in float mode.
+    # Mirror the explicit-quantization behaviour here.
+    spec_config = getattr(vllm_config, "speculative_config", None)
+    draft_model_config = getattr(spec_config, "draft_model_config", None)
+    if draft_model_config is not None and draft_model_config.quantization is None:
+        draft_model_config.quantization = detected
+        # get_quant_config() resolves an ascend checkpoint from its file
+        # (quant_model_description.json) once the hf_config carries no
+        # quantization_config block. That file-fallback branch requires
+        # hf_overrides to be a dict; the draft's is the callable
+        # hf_config_override, so normalize it the same way step3p5 does.
+        if not isinstance(getattr(draft_model_config, "hf_overrides", None), dict):
+            draft_model_config.hf_overrides = {}
+
     # Recreate quant_config on VllmConfig.  The original __post_init__
     # already ran _get_quantization_config(), but at that point
     # model_config.quantization was None so it returned None.  Now that

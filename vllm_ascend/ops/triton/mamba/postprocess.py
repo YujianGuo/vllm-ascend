@@ -199,3 +199,107 @@ def postprocess_mamba_fused_kernel(
         mask = (i + offsets) < copy_size
         data = tl.load(src_ptr + i + offsets, mask=mask)
         tl.store(dst_ptr + i + offsets, data, mask=mask)
+
+
+@triton.jit
+def precopy_mamba_align_fused_kernel(
+    mamba_state_idx_ptr,
+    src_col_ptr,
+    token_bias_ptr,
+    block_table_ptrs_ptr,
+    block_table_stride_req: tl.int64,
+    state_base_addrs_ptr,
+    state_block_strides_ptr,
+    state_elem_sizes_ptr,
+    state_inner_sizes_ptr,
+    state_conv_widths_ptr,
+    state_group_indices_ptr,
+    state_dim_row_count_ptr,
+    state_dim_row_stride_ptr,
+    idx_mapping_ptr,
+    num_reqs,
+    COPY_BLOCK_SIZE: tl.constexpr,
+    CONV_STATE_DIM_FIRST: tl.constexpr,
+):
+    """Ascend-safe V1 align pre-copy for speculative Mamba state."""
+    batch_idx = tl.program_id(0)
+    state_idx = tl.program_id(1)
+    if batch_idx >= num_reqs:
+        return
+
+    req_idx = tl.load(idx_mapping_ptr + batch_idx)
+    if req_idx < 0:
+        return
+    src_block_idx = tl.load(src_col_ptr + req_idx)
+    dest_block_idx = tl.load(mamba_state_idx_ptr + req_idx)
+    if src_block_idx < 0 or src_block_idx == dest_block_idx:
+        return
+
+    accept_token_bias = tl.load(token_bias_ptr + req_idx)
+    state_base_addr = tl.load(state_base_addrs_ptr + state_idx)
+    state_block_stride = tl.load(state_block_strides_ptr + state_idx)
+    state_elem_size = tl.load(state_elem_sizes_ptr + state_idx)
+    state_inner_size = tl.load(state_inner_sizes_ptr + state_idx)
+    conv_width = tl.load(state_conv_widths_ptr + state_idx)
+    group_idx = tl.load(state_group_indices_ptr + state_idx).to(tl.int64)
+
+    group_base_addr = tl.load(block_table_ptrs_ptr + group_idx)
+    block_table_typed = group_base_addr.to(tl.pointer_type(tl.int32))
+    block_table_base = block_table_typed + batch_idx * block_table_stride_req
+    src_block_id = tl.load(block_table_base + src_block_idx).to(tl.int64)
+    dest_block_id = tl.load(block_table_base + dest_block_idx).to(tl.int64)
+    dst_addr = state_base_addr + dest_block_id * state_block_stride
+    is_conv_state = conv_width > 0
+    offsets = tl.arange(0, COPY_BLOCK_SIZE)
+
+    if CONV_STATE_DIM_FIRST and is_conv_state:
+        dim_rows = tl.load(state_dim_row_count_ptr + state_idx)
+        row_stride = tl.load(state_dim_row_stride_ptr + state_idx)
+        per_row_bytes = (
+            (conv_width - accept_token_bias).to(tl.int64) * state_elem_size
+        )
+        bias_bytes = accept_token_bias.to(tl.int64) * state_elem_size
+        src_block_addr = state_base_addr + src_block_id * state_block_stride
+        for row in range(0, dim_rows):
+            row_src_ptr = (
+                src_block_addr + row * row_stride + bias_bytes
+            ).to(tl.pointer_type(tl.uint8))
+            row_dst_ptr = (dst_addr + row * row_stride).to(
+                tl.pointer_type(tl.uint8)
+            )
+            for offset in range(0, per_row_bytes, COPY_BLOCK_SIZE):
+                mask = (offset + offsets) < per_row_bytes
+                data = tl.load(row_src_ptr + offset + offsets, mask=mask)
+                tl.store(row_dst_ptr + offset + offsets, data, mask=mask)
+        return
+
+    if is_conv_state:
+        src_offset = (
+            accept_token_bias.to(tl.int64)
+            * state_inner_size
+            * state_elem_size
+        )
+        src_addr = (
+            state_base_addr + src_block_id * state_block_stride + src_offset
+        )
+        copy_size = (
+            (conv_width - accept_token_bias).to(tl.int64)
+            * state_inner_size
+            * state_elem_size
+        )
+    else:
+        actual_src_block_idx = src_block_idx + accept_token_bias
+        actual_src_block_id = tl.load(
+            block_table_base + actual_src_block_idx
+        ).to(tl.int64)
+        src_addr = state_base_addr + actual_src_block_id * state_block_stride
+        copy_size = state_inner_size * state_elem_size
+
+    # Keep pointer casts outside the dynamic loop. Triton-Ascend's pointer
+    # analysis aborts when this conversion is performed inside the loop body.
+    src_ptr = src_addr.to(tl.pointer_type(tl.uint8))
+    dst_ptr = dst_addr.to(tl.pointer_type(tl.uint8))
+    for offset in range(0, copy_size, COPY_BLOCK_SIZE):
+        mask = (offset + offsets) < copy_size
+        data = tl.load(src_ptr + offset + offsets, mask=mask)
+        tl.store(dst_ptr + offset + offsets, data, mask=mask)

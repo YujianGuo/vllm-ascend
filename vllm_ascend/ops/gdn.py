@@ -30,15 +30,95 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from vllm_ascend import envs
+from vllm_ascend._310p.ops.causal_conv1d import (
+    causal_conv1d_update as causal_conv1d_update_fallback,
+)
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
-from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
+from vllm_ascend.ops.triton.mamba.causal_conv1d import (
+    HAS_TRITON,
+    causal_conv1d_update_npu,
+    extract_last_width,
+)
 
 logger = init_logger(__name__)
+
+
+def _causal_conv1d_custom_with_fallback(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    conv_state: torch.Tensor,
+    bias_opt: torch.Tensor | None,
+    query_start_loc_opt: torch.Tensor | None,
+    cache_indices_opt: torch.Tensor | None,
+    initial_state_mode_opt: torch.Tensor | None,
+    num_accepted_tokens_opt: torch.Tensor | None,
+    activation_mode: int,
+    pad_slot_id: int,
+    run_mode: int,
+) -> None:
+    try:
+        torch.ops._C_ascend.npu_causal_conv1d_custom(
+            output,
+            x,
+            weight,
+            conv_state=conv_state,
+            bias_opt=bias_opt,
+            query_start_loc_opt=query_start_loc_opt,
+            cache_indices_opt=cache_indices_opt,
+            initial_state_mode_opt=initial_state_mode_opt,
+            num_accepted_tokens_opt=num_accepted_tokens_opt,
+            activation_mode=activation_mode,
+            pad_slot_id=pad_slot_id,
+            run_mode=run_mode,
+        )
+    except RuntimeError as exc:
+        if "aclnnCausalConv1d" not in str(exc):
+            raise
+        fallback_cache_indices = cache_indices_opt
+        if fallback_cache_indices is not None and fallback_cache_indices.ndim > 1:
+            fallback_cache_indices = fallback_cache_indices[:, 0]
+        if HAS_TRITON:
+            feature_dim = x.shape[1] if query_start_loc_opt is not None else x.shape[-1]
+            fallback_weight = weight
+            if fallback_weight.shape[0] != feature_dim and fallback_weight.shape[1] == feature_dim:
+                fallback_weight = fallback_weight.transpose(0, 1).contiguous()
+            fallback_state = conv_state
+            if fallback_state.shape[-2] != feature_dim and fallback_state.shape[-1] == feature_dim:
+                fallback_state = fallback_state.transpose(-1, -2)
+            fallback_output = causal_conv1d_update_npu(
+                x,
+                fallback_state,
+                fallback_weight,
+                bias_opt,
+                activation=bool(activation_mode),
+                conv_state_indices=fallback_cache_indices,
+                num_accepted_tokens=num_accepted_tokens_opt,
+                query_start_loc=query_start_loc_opt,
+                max_query_len=x.shape[0],
+                pad_slot_id=pad_slot_id,
+                validate_data=False,
+            )
+            output.copy_(fallback_output)
+            return
+        fallback_output = causal_conv1d_update_fallback(
+            x,
+            conv_state,
+            weight,
+            bias_opt,
+            activation=bool(activation_mode),
+            conv_state_indices=fallback_cache_indices,
+            num_accepted_tokens=num_accepted_tokens_opt,
+            query_start_loc=query_start_loc_opt,
+            pad_slot_id=pad_slot_id,
+        )
+        output.copy_(fallback_output)
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -51,9 +131,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         """Whether ``torch_npu.npu_chunk_gated_delta_rule`` can actually be used.
 
         The interface must exist AND a minimal smoke call must succeed (the op is
-        unavailable on some CANN builds / devices). Any failure disables the
-        fused path so we fall back to the Triton pipeline. The result is cached
-        on the class, so only the first layer runs the smoke call.
+        not available on every CANN build / device). Any failure disables the
+        fused path so the Triton pipeline keeps being used. The result is cached
+        on the class, so only the first GDN layer runs the smoke call.
         """
         if cls._fused_chunk_available is not None:
             return cls._fused_chunk_available
@@ -64,18 +144,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         if not hasattr(torch_npu, "npu_chunk_gated_delta_rule"):
             logger.info(
-                "torch_npu.npu_chunk_gated_delta_rule not found, GDN prefill keeps "
-                "the Triton pipeline."
+                "torch_npu.npu_chunk_gated_delta_rule not found, GDN prefill keeps the Triton pipeline."
             )
             cls._fused_chunk_available = False
             return False
 
-        # TODO(2026/8/6): The A5‑specific implementation is not available in the official release.
-        # Invoking npu_chunk_gated_delta_rule will result in errors.
-        # Remove this conditional block after the new A5 CANN package is released.
         try:
-            # Minimal smoke call matching the op constraints (Dk == Dv == 128,
-            # Nv % Nk == 0). B=1, one short sequence.
+            # Minimal smoke call matching the op constraints: Dk == Dv == 128 and
+            # Nv % Nk == 0.
             device = torch.npu.current_device()
             dk = dv = 128
             nk, nv, seqlen = 1, 1, 64
@@ -141,12 +217,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         (chunk_scaled_dot_kkt_fwd + solve_tril + recompute_w_u_fwd + ...).
         The fused CANN operator expects TND layout and does NOT apply q/k L2 norm
         or the chunk-local cumsum of ``g`` internally, so q/k are normalized here
-        and the raw ``g`` is passed through.
+        and the raw ``g`` (log decay, fp32) is passed through.
 
         Args:
             q, k: ``[1, T, Nk, Dk]``   v: ``[1, T, Nv, Dv]``
             g, beta: ``[1, T, Nv]``    g is fp32 (<=0), beta is (0, 1).
-            initial_state: ``[N, Nv, Dv, Dk]`` — same layout as ``ssm_state``,
+            initial_state: ``[N, Nv, Dv, Dk]`` -- same layout as ``ssm_state``,
                 no transpose required.
             cu_seqlens: cumulative prefill query start locations ``[N+1]``.
             scale: query scaling factor (``Dk ** -0.5``).
@@ -162,12 +238,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         beta = beta.squeeze(0).to(v.dtype).contiguous()  # [T, Nv]
 
         # The fused op only supports a bfloat16 initial_state, while ssm_state may
-        # be float32 (the recurrent path keeps fp32 state). Cast to bf16 here.
+        # keep float32 (the recurrent decode path does). Cast to bf16 here.
         initial_state = initial_state.to(torch.bfloat16).contiguous()
 
-        # actual_seq_lengths is per-batch sequence length [N] (per the interface
-        # doc), derived from the cumulative query_start_loc.
-        actual_seq_lengths = torch.diff(cu_seqlens).to(torch.int32)
+        # actual_seq_lengths holds the per-batch sequence lengths [N], derived
+        # from the cumulative query_start_loc.
+        actual_seq_lengths = torch.diff(cu_seqlens.to(q.device)).to(torch.int32)
 
         o, final_state = torch_npu.npu_chunk_gated_delta_rule(
             q,
@@ -226,8 +302,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             z, _ = self.in_proj_z(hidden_states)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = self._split_ba_for_tp(ba)
-            b = b.contiguous()
-            a = a.contiguous()
         else:
             if not self.gqa_interleaved_layout:
                 mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
@@ -238,9 +312,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
                 ba, _ = self.in_proj_ba(hidden_states)
                 b, a = self._split_ba_for_tp(ba)
-
-                b = b.contiguous()
-                a = a.contiguous()
             else:
                 projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
@@ -343,7 +414,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             spec_causal_conv1d_meta = attn_metadata.spec_decode_metadata.spec_causal_conv1d
             spec_query_start_loc_device = spec_causal_conv1d_meta.query_start_loc
             output_spec = torch.empty_like(mixed_qkv_spec)
-            torch.ops._C_ascend.npu_causal_conv1d_custom(
+            _causal_conv1d_custom_with_fallback(
                 output_spec,
                 mixed_qkv_spec,
                 conv_weights_T,
@@ -390,7 +461,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                             pcp_rank - 1, ...
                         ].transpose(-1, -2)
                     mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
-                    torch.ops._C_ascend.npu_causal_conv1d_custom(
+                    _causal_conv1d_custom_with_fallback(
                         mixed_qkv_non_spec_output,
                         mixed_qkv_non_spec,
                         conv_weights_T,
@@ -413,7 +484,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     conv_weights_T = conv_weights.transpose(0, 1)
                     activation_num = 1 if self.activation else 0
                     mixed_qkv_non_spec_output = torch.empty_like(mixed_qkv_non_spec)
-                    torch.ops._C_ascend.npu_causal_conv1d_custom(
+                    _causal_conv1d_custom_with_fallback(
                         mixed_qkv_non_spec_output,
                         mixed_qkv_non_spec,
                         conv_weights_T,
@@ -434,7 +505,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             non_spec_causal_conv1d_meta = attn_metadata.non_spec_decode_metadata.causal_conv1d
             non_spec_query_start_loc_device = non_spec_causal_conv1d_meta.query_start_loc
             output_non_spec = torch.empty_like(mixed_qkv_non_spec)
-            torch.ops._C_ascend.npu_causal_conv1d_custom(
+            _causal_conv1d_custom_with_fallback(
                 output_non_spec,
                 mixed_qkv_non_spec,
                 conv_weights_T,
@@ -543,9 +614,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 g_non_spec = g_non_spec[:, num_decode_tokens:]
                 beta_non_spec = beta_non_spec[:, num_decode_tokens:]
 
-            # Use the fused CANN operator when available (probed once, cached on
-            # the class) and applicable. It only supports the non-PCP case; fall
-            # back to the Triton pipeline under PCP or if the op is unavailable.
+            # Prefer the fused CANN operator when it is usable. It only supports
+            # the non-PCP single-device path; otherwise fall back to Triton.
             use_fused_chunk = (
                 AscendGatedDeltaNetAttention._probe_fused_chunk()
                 and get_pcp_group().world_size == 1
@@ -556,7 +626,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             if use_fused_chunk:
                 # The fused op's state layout [N, Nv, Dv, Dk] matches ssm_state
                 # directly, so no transpose is needed. Advanced indexing already
-                # returns a copy, safe to clear in place.
+                # returns a copy, which makes the in-place clear safe.
                 initial_state = ssm_state[prefill_state_indices]
                 clear_ssm_states(initial_state, prefill_has_initial_state)
                 core_attn_out_non_spec, last_recurrent_state = (

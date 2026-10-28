@@ -8,6 +8,28 @@ from vllm_ascend.distributed.device_communicators.npu_communicator import NPUCom
 
 
 class TestNPUCommunicator(unittest.TestCase):
+    def test_all_reduce_preserves_input_and_returns_independent_storage(self):
+        comm = NPUCommunicator.__new__(NPUCommunicator)
+        comm.device_group = object()
+        source = torch.arange(12, dtype=torch.float32).reshape(3, 4).T
+        expected_source = source.clone()
+
+        def reduce_in_place(tensor, group):
+            self.assertIs(group, comm.device_group)
+            tensor.mul_(8)
+
+        with patch(
+            "vllm_ascend.distributed.device_communicators.npu_communicator.dist.all_reduce",
+            side_effect=reduce_in_place,
+        ):
+            result = comm.all_reduce(source)
+
+        torch.testing.assert_close(source, expected_source)
+        torch.testing.assert_close(result, expected_source * 8)
+        self.assertNotEqual(result.data_ptr(), source.data_ptr())
+        result.zero_()
+        torch.testing.assert_close(source, expected_source)
+
     @patch("vllm.config.get_current_vllm_config", return_value=None)
     @patch("torch.npu.current_device", return_value=MagicMock())
     @patch("torch.npu.set_device", return_value=MagicMock())

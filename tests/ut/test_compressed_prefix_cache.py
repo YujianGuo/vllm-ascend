@@ -27,6 +27,51 @@ from vllm_ascend.patch.platform.patch_kv_cache_coordinator import AscendHybridKV
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_qsa_hybrid_hit_preserves_every_logical_page(compress_ratio):
+    """A 2304-token hit must retain three 768-token pages, not one.
+
+    The scheduler unwraps the composite QSA group to its first member,
+    which may be the compressed index owner. Its physical storage is
+    smaller, but its block IDs have the same token coverage as main K/V.
+    """
+    block_size = 768
+    spec = MLAAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=1,
+        dtype=torch.float32, compress_ratio=compress_ratio,
+    )
+    state_spec = MambaSpec(
+        block_size=block_size, shapes=((1,),), dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    coordinator = AscendHybridKVCacheCoordinator(
+        kv_cache_config=KVCacheConfig(
+            num_blocks=32, kv_cache_tensors=[], kv_cache_groups=[
+                KVCacheGroupSpec(["qsa"], spec),
+                KVCacheGroupSpec(["state"], state_spec),
+            ],
+        ),
+        max_model_len=4096, use_eagle=False, enable_caching=True,
+        enable_kv_cache_events=False, dcp_world_size=1, pcp_world_size=1,
+        hash_block_size=block_size, scheduler_block_size=block_size,
+        max_in_flight_tokens=4096,
+    )
+    request = _make_request("qsa-hit", list(range(3 * block_size)), block_size)
+    cached = []
+    for group_id in range(2):
+        blocks = coordinator.block_pool.get_new_blocks(3)
+        coordinator.block_pool.cache_full_blocks(
+            request=request, blocks=blocks, num_cached_blocks=0,
+            num_full_blocks=3, block_size=block_size, kv_cache_group_id=group_id,
+        )
+        cached.append(blocks)
+    hit, length, _ = coordinator.find_longest_cache_hit(request.block_hashes, 2304)
+    assert length == 2304
+    assert hit[0] == cached[0]
+    assert len(hit[0]) * block_size == length
+    assert hit[1][-1] is cached[1][-1]
+
+
 @pytest.fixture(autouse=True)
 def _init_hash_seed():
     init_none_hash(sha256)

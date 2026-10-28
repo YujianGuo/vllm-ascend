@@ -1,5 +1,7 @@
-from typing import TYPE_CHECKING, Any
+import os
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
+import vllm.config.speculative as vllm_speculative
 from vllm.config.speculative import SpeculativeConfig
 from vllm.transformers_utils.configs.speculators import algos as speculator_algos
 from vllm.utils.import_utils import LazyLoader
@@ -10,6 +12,13 @@ from vllm_ascend.transformers_utils.configs.kimi_k3 import (
 )
 
 _orig_post_init = SpeculativeConfig.__post_init__
+
+# vLLM 0.26 predates Qwen4Exp MTP. Extend its runtime validation list before
+# SpeculativeConfig normalizes the draft model returned by hf_config_override.
+if "qwen4_exp_mtp" not in get_args(vllm_speculative.MTPModelTypes):
+    vllm_speculative.MTPModelTypes = Literal.__getitem__(
+        get_args(vllm_speculative.MTPModelTypes) + ("qwen4_exp_mtp",)
+    )
 
 if TYPE_CHECKING:
     import vllm.model_executor.layers.quantization as me_quant
@@ -161,6 +170,34 @@ def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
                 "architectures": ["Qwen3_5MoeMTP" if is_moe else "Qwen3_5MTP"],
             }
         )
+    if hf_config.model_type in ("qwen4_exp", "qwen4_exp_text"):
+        text_config = getattr(hf_config, "text_config", hf_config)
+        text_config.model_type = "qwen4_exp_mtp"
+        # get_quant_config() looks up quantization_config on the draft model's
+        # hf_config. The checkpoint keeps the block on the top-level config, so
+        # propagate it onto the text config the same way the step3p5 branch
+        # below does. Never synthesize a marker when the checkpoint carries
+        # none: a dict on hf_config makes vLLM treat the model as quantized
+        # (ModelConfig._get_quantization_config → AscendModelSlimConfig), which
+        # poisons bf16 checkpoints whose quantization must be resolved through
+        # auto-detection instead (quant_model_description.json present or not).
+        quantization_config = getattr(hf_config, "quantization_config", None)
+        if quantization_config is not None and getattr(text_config, "quantization_config", None) is None:
+            text_config.update({"quantization_config": quantization_config})
+        n_predict = getattr(text_config, "mtp_num_hidden_layers", 1)
+        index_share = getattr(text_config, "index_share_for_mtp_iteration", None)
+        if index_share is None:
+            index_share = os.getenv(
+                "VLLM_ASCEND_MTP_INDEX_SHARE_FOR_MTP", ""
+            ).lower() in {"1", "true", "yes", "on"}
+        text_config.update(
+            {
+                "n_predict": n_predict,
+                "architectures": ["Qwen4ExpMTP"],
+                "index_share_for_mtp_iteration": index_share,
+            }
+        )
+        hf_config = text_config
     if hf_config.model_type in ("longcat_flash", "longcat_flash_ngram"):
         hf_config.model_type = "longcat_flash_mtp"
         n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)

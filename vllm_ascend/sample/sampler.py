@@ -46,6 +46,35 @@ def random_sample(
 
 class AscendSampler(Sampler):
     @staticmethod
+    def compute_logprobs(logits: torch.Tensor) -> torch.Tensor:
+        """Compute logprobs in the global TP vocabulary space.
+
+        Reduce-sample keeps the LM head sharded.  The base implementation
+        applies log_softmax to that shard, which gives a locally normalized
+        distribution and corrupts raw/prompt logprobs and ranks.  Gather the
+        shards first; this is the correctness baseline before a compact
+        global-LSE implementation is introduced.
+        """
+        if not get_ascend_config().enable_reduce_sample:
+            return Sampler.compute_logprobs(logits)
+        tp_group = get_tp_group()
+        if tp_group.world_size == 1:
+            return logits.log_softmax(dim=-1, dtype=torch.float32)
+        # Compute the normalization with the numerically stable global-LSE
+        # reduction first.  The full gather below preserves the base sampler
+        # logprobs tensor contract (including num_logprobs=-1 and ranking).
+        logits_f = logits.to(torch.float32)
+        local_max = logits_f.amax(dim=-1)
+        global_max = local_max.clone()
+        torch.distributed.all_reduce(global_max, op=torch.distributed.ReduceOp.MAX, group=tp_group.device_group)
+        local_sum = torch.exp(logits_f - global_max.unsqueeze(-1)).sum(dim=-1)
+        global_sum = local_sum.clone()
+        torch.distributed.all_reduce(global_sum, op=torch.distributed.ReduceOp.SUM, group=tp_group.device_group)
+        global_lse = global_max + global_sum.log()
+        full_logits = tp_group.all_gather(logits_f, dim=-1)
+        return full_logits - global_lse.unsqueeze(-1)
+
+    @staticmethod
     def apply_penalties(
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
@@ -183,13 +212,19 @@ def _apply_top_k_top_p_pytorch(
         if p is None and k is None:
             return gathered_vals, gathered_idx
 
+        if k is not None:
+            global_k = top_k if top_k is not None else gathered_vals.shape[-1]
+            global_k = min(max(global_k, 1), gathered_vals.shape[-1])
+            gathered_vals, order = torch.topk(gathered_vals, k=global_k, dim=-1)
+            gathered_idx = gathered_idx.gather(-1, order)
+
         probs = gathered_vals.softmax(dim=-1)
         probs_sort, _ = probs.sort(dim=-1, descending=False)
         if k is not None:
-            kk = k.to(torch.long).clamp(min=1, max=V_local)
+            kk = k.to(torch.long).clamp(min=1, max=gathered_vals.shape[-1])
             top_k_count = (probs_sort.size(1) - kk).unsqueeze(1)  # [B,1]
             top_k_cutoff = probs_sort.gather(-1, top_k_count)
-            no_top_k_mask = (kk == V_local).unsqueeze(1)
+            no_top_k_mask = (kk == gathered_vals.shape[-1]).unsqueeze(1)
             top_k_cutoff.masked_fill_(no_top_k_mask, -float("inf"))
             elements_to_discard = probs < top_k_cutoff
             gathered_vals.masked_fill_(elements_to_discard, -float("inf"))
@@ -256,6 +291,13 @@ def _apply_top_k_top_p_torch_npu(
         gathered_idx = tp_group.all_gather(local_global_idx, dim=-1)
 
         if not (p is None and k is None):
+            # The local top-k union is only a candidate set. Re-select the
+            # requested k globally before applying top-p.
+            if k is not None:
+                global_k = top_k if top_k is not None else gathered_vals.shape[-1]
+                global_k = min(max(global_k, 1), gathered_vals.shape[-1])
+                gathered_vals, order = torch.topk(gathered_vals, k=global_k, dim=-1)
+                gathered_idx = gathered_idx.gather(-1, order)
             gathered_vals = torch_npu.npu_top_k_top_p(gathered_vals, k=k, p=p)
         return gathered_vals, gathered_idx
 

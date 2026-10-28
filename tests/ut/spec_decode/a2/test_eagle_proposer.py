@@ -1175,7 +1175,13 @@ class TestEagleProposerPropose:
             self.proposer.method = 'mtp'
             if not self.is_decode(flag_prefill_decode):
                 num_actual_tokens = 9
-        self.runner._sync_metadata_across_dp.return_value = (num_actual_tokens, None, False)
+        def sync_metadata(*_args, draft_batch_size=None, **_kwargs):
+            result = (num_actual_tokens, None, False)
+            if draft_batch_size is None:
+                return result
+            return (*result, draft_batch_size)
+
+        self.runner._sync_metadata_across_dp.side_effect = sync_metadata
         self.proposer.model = MagicMock(spec=Eagle3LlamaForCausalLM)
         custom_combined_hidden_states = torch.zeros(num_actual_tokens, 4096, device=self.device, dtype=torch.bfloat16)
         self.proposer.model.combine_hidden_states.return_value = custom_combined_hidden_states
@@ -1423,7 +1429,7 @@ class TestEagleProposerPropose:
                 assert torch.equal(captured_common_attn_metadata.seq_lens_cpu, torch.tensor([11]))
                 assert captured_common_attn_metadata._seq_lens_cpu == torch.tensor([11])
                 assert torch.equal(captured_common_attn_metadata.positions, torch.tensor([10, 1, 2, 3, 4, 5, 6, 7, 8] + [0]*(8704-9), dtype=torch.int64))
-                assert captured_common_attn_metadata.num_input_tokens == 9
+                assert captured_common_attn_metadata.num_input_tokens == 1
             if model_type == 'qwen_dense' or model_type == 'qwen_moe':
                 if flag_prefill_decode == 'prefill':
                     assert torch.equal(captured_common_attn_metadata.seq_lens, torch.tensor([15]))
@@ -1431,7 +1437,7 @@ class TestEagleProposerPropose:
                     assert torch.equal(captured_common_attn_metadata.slot_mapping, torch.cat([torch.tensor([142]), torch.full((8703,), -1)]))
                     assert torch.equal(captured_common_attn_metadata.seq_lens_cpu, torch.tensor([15]))
                     assert torch.equal(captured_common_attn_metadata.positions, torch.tensor([14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] + [0]*(8704-13), dtype=torch.int64))
-                    assert captured_common_attn_metadata.num_input_tokens == 13
+                    assert captured_common_attn_metadata.num_input_tokens == 1
                 if flag_prefill_decode == 'decode_and_prefill':
                     assert torch.equal(captured_common_attn_metadata.seq_lens, torch.tensor([19, 15, 15]))
                     assert captured_common_attn_metadata.max_seq_len == 0
@@ -1439,7 +1445,7 @@ class TestEagleProposerPropose:
                     assert torch.equal(captured_common_attn_metadata.seq_lens_cpu, torch.tensor([19, 15, 15]))
                     assert torch.equal(captured_common_attn_metadata.positions, torch.tensor([18, 14, 14, 16, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
                                                                                               0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] + [0]*(8704-30), dtype=torch.int64))
-                    assert captured_common_attn_metadata.num_input_tokens == 30
+                    assert captured_common_attn_metadata.num_input_tokens == 3
 
         if self.is_decode(flag_prefill_decode):
             if graphmode == 'full':
@@ -1454,7 +1460,7 @@ class TestEagleProposerPropose:
                 assert torch.equal(captured_common_attn_metadata.query_start_loc_cpu, torch.tensor([0, 1, 2, 3]))
                 assert captured_common_attn_metadata.num_reqs == 3
                 assert torch.equal(captured_common_attn_metadata.block_table_tensor, torch.cat([torch.eye(256, device="cpu", dtype=torch.int32)[0].unsqueeze(0)*i for i in [1,2,3]], dim=0))
-                assert captured_common_attn_metadata.num_input_tokens == 12
+                assert captured_common_attn_metadata.num_input_tokens == 3
             assert captured_common_attn_metadata.num_actual_tokens == 3
             assert captured_common_attn_metadata.max_query_len == 1
             assert captured_common_attn_metadata.max_seq_len == 0
@@ -1621,7 +1627,10 @@ class TestEagleProposerPropose:
         assert hasattr(RunnerCls, "_sync_metadata_across_dp")
         sig = inspect.signature(RunnerCls._sync_metadata_across_dp)
         sig_name = self.get_param_names(sig)
-        assert sig_name == ['self', 'num_tokens', 'is_draft_model', 'cudagraph_mode', 'allow_dp_padding']
+        assert sig_name == [
+            'self', 'num_tokens', 'is_draft_model', 'cudagraph_mode',
+            'allow_dp_padding', 'draft_batch_size'
+        ]
 
         assert hasattr(RunnerCls, "_pad_query_start_loc_for_fia")
         sig = inspect.signature(RunnerCls._pad_query_start_loc_for_fia)
@@ -1729,7 +1738,7 @@ class TestEagleProposerPropose:
         sig_name = self.get_param_names(sig)
         assert sig_name == ['self', 'num_input_tokens', 'batch_size', 'token_indices_to_sample',
                             'target_positions', 'inputs_embeds', 'multi_steps_attn_metadata',
-                            'num_tokens', 'is_prefill'
+                            'num_tokens', 'is_prefill', 'max_tail_batch_size'
                         ]
 
 
@@ -2528,6 +2537,7 @@ class TestRunMergedDraft(TestBase):
             "multi_steps_attn_metadata",
             "num_tokens",
             "is_prefill",
+            "max_tail_batch_size",
         ]
         sig = inspect.signature(RunnerCls.maybe_pad_and_reduce)
         sig_name = self.get_param_names(sig)

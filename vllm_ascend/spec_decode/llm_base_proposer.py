@@ -28,6 +28,7 @@ from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
 from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkForCausalLM
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -54,6 +55,10 @@ from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.deepseek_v4_dspark import DSparkDeepseekV4ForCausalLM
 from vllm_ascend.models.kimi_k3_dspark import K3DSparkForCausalLM
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
+from vllm_ascend.models.qwen4_exp.common.qsa_cache import QSAMetadataBuilder
+from vllm_ascend.models.qwen4_exp.short_conv_attn import (
+    PleShortConvAttentionMetadataBuilder,
+)
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.spec_decode.utils import (
@@ -481,8 +486,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.attn_layer_names = list(sorted(self._draft_attn_layer_names))
         draft_attn_layers_dict = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         # initialized for mamba models
-        self.kernel_block_size = (
+        kernel_block_size = (
             draft_attn_layers_dict[self.attn_layer_names[0]].get_attn_backend().get_supported_kernel_block_sizes()[0]
+        )
+        # Some backends advertise a block-size constraint rather than a
+        # concrete integer. Slot-mapping arithmetic needs the constraint's
+        # integer base, matching the model runner's normalization.
+        self.kernel_block_size = (
+            kernel_block_size.base if isinstance(kernel_block_size, MultipleOf) else kernel_block_size
         )
 
         # Sliding-window draft attention adapter.
@@ -740,10 +751,61 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             return self.model.unwrap()
         return self.model
 
+    def _use_compact_mtp_steps(self):
+        return self.method == "mtp" and (not self.use_cuda_graph or getattr(self, "compact_draft_steps", False))
+
     def shallow_copy_metadata(self, attn_metadata):
         # Currently, new objects will be assigned to the lists in attn_metadata
         # when update. So we can use the shallow copy.
         return copy.copy(attn_metadata)
+
+    def build_dummy_draft_attn_metadata(self, common_attn_metadata, num_tokens, num_reqs):
+        multi_steps_attn_metadata = []
+        assert len(self.draft_attn_groups) > 0
+        builder = self.draft_attn_groups[0].get_metadata_builder()
+        kv_cache_spec = self.draft_attn_groups[0].kv_cache_spec
+        # update the tensor's address for each step.
+        for draft_index in range(self.num_speculative_tokens):
+            common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
+            extra_attn_metadata_args: dict = {}
+            if self.use_compress:
+                extra_attn_metadata_args.update(
+                    prefill_ratio_to_sas_metadata=dict(),
+                    decode_ratio_to_sas_metadata=dict(),
+                    common_ratio_to_sas_metadata=dict(),
+                    block_size=kv_cache_spec.block_size,
+                )
+            # Set the real slot_mapping.
+            slot_mapping_lens = common_attn_metadata.slot_mapping.shape[0]
+            self.slot_mapping_group[draft_index][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping)
+            self.slot_mapping_group[draft_index][slot_mapping_lens:].fill_(PADDING_SLOT_ID)
+            common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_index]
+            self.seq_lens_group[draft_index][:num_reqs].copy_(common_attn_metadata.seq_lens)
+            self.seq_lens_group[draft_index][num_reqs:].fill_(0)
+            common_attn_metadata.seq_lens = self.seq_lens_group[draft_index][:num_reqs]
+            self.query_start_loc_group[draft_index][: num_reqs + 1].copy_(common_attn_metadata.query_start_loc)
+            self.query_start_loc_group[draft_index][num_reqs + 1 :].fill_(0)
+            common_attn_metadata.query_start_loc = self.query_start_loc_group[draft_index][: num_reqs + 1]
+            if self.dcp_size > 1 and draft_index > 0:
+                assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
+                common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[:num_reqs]
+            if not self.use_compress or draft_index == 0:
+                attn_metadata_eagle = builder.build_for_graph_capture(
+                    common_attn_metadata,
+                    AscendAttentionState.SpecDecoding if self.method == "mtp" else AscendAttentionState.ChunkedPrefill,
+                    **extra_attn_metadata_args,
+                )
+            else:
+                attn_metadata_eagle = builder.build_for_drafting(
+                    common_attn_metadata,
+                    draft_index,
+                    **extra_attn_metadata_args,
+                )
+            per_layer_attn_metadata = dict()
+            for layer_name in self.attn_layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata_eagle
+            multi_steps_attn_metadata.append(per_layer_attn_metadata)
+        return multi_steps_attn_metadata
 
     @torch.inference_mode()
     def dummy_run(
@@ -758,11 +820,28 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         dummy_compute_logits=lambda hidden_states: None,
         is_profile=False,
     ):
-        (
+        dummy_draft_batch_size = None
+        if self._use_compact_mtp_steps():
+            # Keep dummy and real MTP eager runs on the same DP collective
+            # shape. The synthetic batch is uniform by construction.
+            dummy_draft_batch_size = max(num_tokens // (self.num_speculative_tokens + 1), 1)
+            if is_profile:
+                dummy_draft_batch_size = min(dummy_draft_batch_size, self.runner.max_num_reqs)
+        sync_result = self.runner._sync_metadata_across_dp(
             num_tokens,
-            num_tokens_across_dp,
-            _,
-        ) = self.runner._sync_metadata_across_dp(num_tokens, is_draft_model=True)
+            is_draft_model=True,
+            draft_batch_size=dummy_draft_batch_size,
+        )
+        if dummy_draft_batch_size is None:
+            num_tokens, num_tokens_across_dp, _ = sync_result
+            max_tail_batch_size = None
+        else:
+            (
+                num_tokens,
+                num_tokens_across_dp,
+                _,
+                max_tail_batch_size,
+            ) = sync_result
         dcp_manager = getattr(self.runner, "dcp_manager", None)
 
         multi_steps_attn_metadata = []
@@ -835,52 +914,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     # update long_seq related params and flatten block_table
                     common_attn_metadata.context_parallel_metadata = dcp_manager.long_seq_metadata
 
-                assert len(self.draft_attn_groups) > 0
-                builder = self.draft_attn_groups[0].get_metadata_builder()
-                kv_cache_spec = self.draft_attn_groups[0].kv_cache_spec
-                # update the tensor's address for each step.
-                for draft_index in range(self.num_speculative_tokens):
-                    common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
-                    extra_attn_metadata_args: dict = {}
-                    if self.use_compress:
-                        extra_attn_metadata_args.update(
-                            prefill_ratio_to_sas_metadata=dict(),
-                            decode_ratio_to_sas_metadata=dict(),
-                            common_ratio_to_sas_metadata=dict(),
-                            block_size=kv_cache_spec.block_size,
-                        )
-                    # Set the real slot_mapping.
-                    slot_mapping_lens = common_attn_metadata.slot_mapping.shape[0]
-                    self.slot_mapping_group[draft_index][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping)
-                    self.slot_mapping_group[draft_index][slot_mapping_lens:].fill_(PADDING_SLOT_ID)
-                    common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_index]
-                    self.seq_lens_group[draft_index][:num_reqs].copy_(common_attn_metadata.seq_lens)
-                    self.seq_lens_group[draft_index][num_reqs:].fill_(0)
-                    common_attn_metadata.seq_lens = self.seq_lens_group[draft_index][:num_reqs]
-                    self.query_start_loc_group[draft_index][: num_reqs + 1].copy_(common_attn_metadata.query_start_loc)
-                    self.query_start_loc_group[draft_index][num_reqs + 1 :].fill_(0)
-                    common_attn_metadata.query_start_loc = self.query_start_loc_group[draft_index][: num_reqs + 1]
-                    if self.dcp_size > 1 and draft_index > 0:
-                        assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
-                        common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[:num_reqs]
-                    if not self.use_compress or draft_index == 0:
-                        attn_metadata_eagle = builder.build_for_graph_capture(
-                            common_attn_metadata,
-                            AscendAttentionState.SpecDecoding
-                            if self.method == "mtp"
-                            else AscendAttentionState.ChunkedPrefill,
-                            **extra_attn_metadata_args,
-                        )
-                    else:
-                        attn_metadata_eagle = builder.build_for_drafting(
-                            common_attn_metadata,
-                            draft_index,
-                            **extra_attn_metadata_args,
-                        )
-                    per_layer_attn_metadata = dict()
-                    for layer_name in self.attn_layer_names:
-                        per_layer_attn_metadata[layer_name] = attn_metadata_eagle
-                    multi_steps_attn_metadata.append(per_layer_attn_metadata)
+                multi_steps_attn_metadata = self.build_dummy_draft_attn_metadata(
+                    common_attn_metadata, num_tokens, num_reqs
+                )
 
         model_positions = self._get_positions(num_tokens)
 
@@ -888,6 +924,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # TODO: temporarily hack here, we should find out batch_size for profile_run
         if is_profile:
             batch_size = min(batch_size, self.runner.max_num_reqs)
+        if max_tail_batch_size is not None:
+            # On an idle DP rank, num_tokens is padded to the active rank's
+            # first draft step and cannot be used to infer its request count.
+            batch_size = max_tail_batch_size
 
         if self.supports_mm_inputs:
             mm_embeds, is_mm_embed = (None, None)
@@ -921,7 +961,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
-            self._runnable(
+            runnable_kwargs = dict(
                 num_input_tokens=num_tokens,
                 batch_size=batch_size,
                 token_indices_to_sample=self.token_indices_to_sample[: batch_size * self.extra_slots_per_request],
@@ -931,6 +971,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 multi_steps_attn_metadata=multi_steps_attn_metadata,
                 num_tokens=num_tokens,
             )
+            if self._use_compact_mtp_steps():
+                runnable_kwargs["max_tail_batch_size"] = max_tail_batch_size
+            self._runnable(**runnable_kwargs)
             forward_context = get_forward_context()
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
                 self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
@@ -1070,11 +1113,22 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             num_input_tokens = num_tokens
 
-        (
+        sync_draft_batch_size = batch_size if self._use_compact_mtp_steps() else None
+        sync_result = self.runner._sync_metadata_across_dp(
             num_input_tokens,
-            num_tokens_across_dp,
-            _,
-        ) = self.runner._sync_metadata_across_dp(num_input_tokens, is_draft_model=True)
+            is_draft_model=True,
+            draft_batch_size=sync_draft_batch_size,
+        )
+        if sync_draft_batch_size is None:
+            num_input_tokens, num_tokens_across_dp, _ = sync_result
+            max_tail_batch_size = batch_size
+        else:
+            (
+                num_input_tokens,
+                num_tokens_across_dp,
+                _,
+                max_tail_batch_size,
+            ) = sync_result
 
         if self.use_cuda_graph:
             aclgraph_runtime_mode, batch_descriptor = self.runner.cudagraph_dispatcher.dispatch(
@@ -1179,7 +1233,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         self._pad_draft_buffers(num_tokens, num_input_tokens)
         multi_steps_attn_metadata, attn_metadata_i = self.build_draft_attn_metadata(
-            common_attn_metadata, num_input_tokens, num_tokens
+            common_attn_metadata,
+            num_input_tokens,
+            num_tokens,
+            num_reqs_actual=batch_size,
         )
 
         if self.uses_mrope:
@@ -1228,25 +1285,22 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     mtp_slot_mapping=dcp_mtp_inputs.slot_mapping,
                 )
 
+        # Eager draft steps after step 0 consume one token per request. Keep
+        # the larger captured size only for graph execution; otherwise the MTP
+        # layer processes stale padding rows and amplifies MoE communication.
+        later_step_input_size = num_input_tokens if self.use_cuda_graph else batch_size
         should_update_next_steps = not self.parallel_drafting and (self.dcp_size == 1 or dcp_mtp_inputs is not None)
         if should_update_next_steps:
-            # Copy the old attn_metadata and update
-            for draft_index in range(1, self.num_speculative_tokens):
-                per_layer_attn_metadata = dict()
-                for attn_group in self.draft_attn_groups:
-                    common_attn_metadata, attn_metadata = self.attn_update_stack_num_spec_norm(
-                        draft_index,
-                        common_attn_metadata,
-                        batch_size,
-                        num_input_tokens,
-                        used_update_positions,
-                        aclgraph_runtime_mode,
-                        **draft_cp_kwargs,
-                        attn_group=attn_group,
-                    )
-                    for layer_name in self.attn_layer_names:
-                        per_layer_attn_metadata[layer_name] = attn_metadata
-                multi_steps_attn_metadata.append(per_layer_attn_metadata)
+            multi_steps_attn_metadata.extend(
+                self.build_later_draft_attn_metadata(
+                    common_attn_metadata,
+                    batch_size,
+                    later_step_input_size,
+                    used_update_positions,
+                    aclgraph_runtime_mode,
+                    **draft_cp_kwargs,
+                )
+            )
 
         token_indices_to_sample_len = token_indices_to_sample.shape[0]
         self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
@@ -1280,6 +1334,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "multi_steps_attn_metadata": multi_steps_attn_metadata,
                 "num_tokens": num_tokens,
                 "is_prefill": is_prefill_batch,
+                "max_tail_batch_size": max_tail_batch_size,
             }
             runnable = cast(Callable[..., Any], self._runnable)
             run_draft: Callable[[], Any] = partial(runnable, **model_inputs)
@@ -1290,7 +1345,37 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             else:
                 draft_token_ids = run_draft()
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+        if self._use_compact_mtp_steps():
+            return draft_token_ids[:batch_size]
         return draft_token_ids
+
+    def build_later_draft_attn_metadata(
+        self,
+        common_attn_metadata,
+        batch_size,
+        input_batch_size,
+        used_update_positions,
+        aclgraph_runtime_mode,
+        **draft_cp_kwargs,
+    ):
+        multi_steps_attn_metadata = []
+        for draft_index in range(1, self.num_speculative_tokens):
+            per_layer_attn_metadata = {}
+            for attn_group in self.draft_attn_groups:
+                common_attn_metadata, attn_metadata = self.attn_update_stack_num_spec_norm(
+                    draft_index,
+                    common_attn_metadata,
+                    batch_size,
+                    input_batch_size,
+                    used_update_positions,
+                    aclgraph_runtime_mode,
+                    **draft_cp_kwargs,
+                    attn_group=attn_group,
+                )
+                for layer_name in self.attn_layer_names:
+                    per_layer_attn_metadata[layer_name] = attn_metadata
+            multi_steps_attn_metadata.append(per_layer_attn_metadata)
+        return multi_steps_attn_metadata
 
     def compute_draft_token_ids(self, hidden_states: torch.Tensor):
         if self.method in ("eagle3", "dflash", "dspark"):
@@ -1317,6 +1402,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         multi_steps_attn_metadata,
         num_tokens,
         is_prefill=None,
+        max_tail_batch_size=None,
     ) -> torch.Tensor:
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
@@ -1351,6 +1437,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         draft_model = getattr(self.model, "model", None)
         if self._share_mtp_indices and draft_model is not None and hasattr(draft_model, "set_skip_topk"):
             draft_model.set_skip_topk(True)
+            # Step 0 writes one sparse-index row for every token in the
+            # padded draft batch. Later steps run one token per request, so
+            # move each request's sampled row to the compact batch prefix.
+            draft_model.compact_topk_indices(token_indices_to_sample)
 
         if self.method != "dflash":
             last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
@@ -1474,11 +1564,33 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         hidden_states = hidden_states[token_indices_to_sample]
         token_indices_to_sample = self.arange[:batch_size]
 
-        input_batch_size = num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size
+        input_batch_size = num_input_tokens if self.use_cuda_graph and not self._use_compact_mtp_steps() else batch_size
 
         forward_context = get_forward_context()
         _EXTRA_CTX.num_tokens = input_batch_size
         _EXTRA_CTX.num_accept_tokens = batch_size
+        if self._use_compact_mtp_steps():
+            assert max_tail_batch_size is not None
+            tp_world_size = get_tp_group().world_size
+            padded_tail_tokens = ((max_tail_batch_size + tp_world_size - 1) // tp_world_size) * tp_world_size
+            current_mc2_mask = getattr(forward_context, "mc2_mask", None)
+            if current_mc2_mask is not None and current_mc2_mask.numel() < padded_tail_tokens:
+                raise RuntimeError(
+                    "MTP eager tail MC2 mask is smaller than its synchronized "
+                    f"token shape: mask={current_mc2_mask.numel()}, "
+                    f"tokens={padded_tail_tokens}"
+                )
+            forward_context.num_tokens = input_batch_size
+            forward_context.max_tokens_across_dp = max_tail_batch_size
+            forward_context.padded_num_tokens = padded_tail_tokens
+            if current_mc2_mask is not None:
+                tail_mc2_mask = current_mc2_mask[:padded_tail_tokens]
+                if self.use_cuda_graph and self._use_compact_mtp_steps():
+                    tail_mc2_mask[:batch_size].copy_(self.slot_mapping_group[1][:batch_size] >= 0)
+                else:
+                    tail_mc2_mask[:batch_size] = True
+                tail_mc2_mask[batch_size:] = False
+                forward_context.mc2_mask = tail_mc2_mask
 
         for draft_index in range(self.num_speculative_tokens - 1):
             # Reset MOE layer index for each draft step iteration
@@ -1968,8 +2080,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         attn_metadata_builder = attn_group.get_metadata_builder()
 
         extra_attn_metadata_args = {}
+        if isinstance(
+            attn_metadata_builder,
+            (QSAMetadataBuilder, PleShortConvAttentionMetadataBuilder),
+        ):
+            extra_attn_metadata_args["num_reqs_actual"] = batch_size
         if self.use_compress:
-            extra_attn_metadata_args = dict(
+            extra_attn_metadata_args.update(
                 prefill_ratio_to_sas_metadata=dict(),
                 decode_ratio_to_sas_metadata=dict(),
                 common_ratio_to_sas_metadata=dict(),
@@ -2296,7 +2413,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     # update full-graph params for one spec token
     def _update_full_graph_params(self, forward_context, num_tokens, draft_attn_metadatas=None):
         assert len(self.draft_attn_groups) > 0
-        attn_backend = self.draft_attn_groups[0].backend
+        attn_backend = None
+        for group in self.draft_attn_groups:
+            backend = group.backend
+            if not getattr(backend, "supports_graph_param_update", True):
+                continue
+            impl_cls = backend.get_impl_cls()
+            if hasattr(impl_cls, "update_graph_params"):
+                attn_backend = backend
+                break
+        if attn_backend is None:
+            # QSA/PLE draft metadata is backed by static buffers and does not
+            # use the generic FIA graph-parameter side channel.
+            return
         update_full_graph_params(
             attn_backend,
             self.update_stream,
@@ -2409,6 +2538,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         common_attn_metadata,
         num_input_tokens,
         num_actual_tokens,
+        num_reqs_actual=None,
     ):
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
@@ -2416,8 +2546,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         for attn_group in self.draft_attn_groups:
             builder = attn_group.get_metadata_builder()
             extra_attn_metadata_args: dict = {}
+            if isinstance(
+                builder,
+                (QSAMetadataBuilder, PleShortConvAttentionMetadataBuilder),
+            ):
+                extra_attn_metadata_args["num_reqs_actual"] = num_reqs_actual
             if self.use_compress:
-                extra_attn_metadata_args = dict(
+                extra_attn_metadata_args.update(
                     prefill_ratio_to_sas_metadata=dict(),
                     decode_ratio_to_sas_metadata=dict(),
                     common_ratio_to_sas_metadata=dict(),

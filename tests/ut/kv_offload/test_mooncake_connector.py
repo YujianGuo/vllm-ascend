@@ -56,7 +56,9 @@ patch(
     "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_pcp_group", return_value=_mock_pcp_group
 ).start()
 patch("vllm.distributed.parallel_state._DCP", _mock_dcp_group).start()
-patch("torch.npu.set_device").start()
+# NOTE: torch.npu.set_device is intentionally NOT patched at module scope.
+# The dedicated bind tests patch it locally; a global mock here leaks into
+# later test modules (QSA graph tests) and breaks their real device calls.
 
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
@@ -82,6 +84,13 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # n
 
 for _k, _v in _saved_modules.items():
     sys.modules[_k] = _v
+
+# Stop the module-level patches on interpreter exit so later test modules
+# (e.g. the QSA graph tests, which make real device calls) are not polluted
+# by the permanent torch.npu.set_device / parallel_state mocks.
+import atexit as _atexit  # noqa: E402
+
+_atexit.register(patch.stopall)
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"

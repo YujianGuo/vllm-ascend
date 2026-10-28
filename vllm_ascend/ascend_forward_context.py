@@ -34,6 +34,11 @@ _MEGA_MOE_TOKENS_PER_RANK_LIMIT = 4096
 _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT = 512
 _MC2_TOKENS_PER_RANK_LIMIT = 512
 
+# Emit the dp_metadata-missing warning exactly once. It means max_tokens_across_dp
+# fell back to the LOCAL token count on a MoE DP forward; if per-DP counts differ,
+# the cross-DP HcomAllGather will mismatch across the EP ring.
+_warned_dp_metadata_fallback = False
+
 
 def _is_decode_only_node(vllm_config: VllmConfig) -> bool:
     kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
@@ -218,6 +223,19 @@ def set_ascend_forward_context(
                 forward_context.padded_length = padded_length
                 forward_context.pad_size = pad_size
         else:
+            global _warned_dp_metadata_fallback
+            if dp_world_size > 1 and is_moe_model(vllm_config) and num_tokens is not None:
+                if not _warned_dp_metadata_fallback:
+                    _warned_dp_metadata_fallback = True
+                    logger.warning(
+                        "set_ascend_forward_context: dp_world_size=%d but "
+                        "forward_context.dp_metadata is None on a MoE model; "
+                        "max_tokens_across_dp falls back to the LOCAL num_tokens=%d. "
+                        "If per-DP ranks differ, the cross-DP MoE HcomAllGather will "
+                        "mismatch across the EP ring.",
+                        dp_world_size,
+                        num_tokens,
+                    )
             max_tokens_across_dp = num_tokens
 
         forward_context.max_tokens_across_dp = max_tokens_across_dp

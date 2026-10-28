@@ -27,14 +27,26 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MLAAttentionSpec,
     MambaSpec,
+    UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_interface import AscendCircularBufferSpec
 from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
 
 USE_MULTI_GROUPS_KV_CACHE = True
 
 _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
+
+
+def _uses_prefix_cache_hashes(kv_cache_spec: KVCacheSpec) -> bool:
+    # QSA raw-key owners are often wrapped in UniformTypeKVCacheSpecs by the
+    # cache-group planner.  Preserve the non-hashable property through that
+    # wrapper; a group is hashable if at least one of its members is.
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        return any(_uses_prefix_cache_hashes(spec) for spec in kv_cache_spec.kv_cache_specs.values())
+    return not isinstance(kv_cache_spec, AscendCircularBufferSpec)
 
 
 def _select_kv_token_budget(
@@ -158,6 +170,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             assert all(
                 self._get_effective_block_size(g.kv_cache_spec) % hash_block_size == 0
                 for g in kv_cache_config.kv_cache_groups
+                if _uses_prefix_cache_hashes(g.kv_cache_spec)
             ), "block_size must be divisible by hash_block_size"
         self.enable_partial_hash_hits = dcp_world_size == 1 and any(
             isinstance(g.kv_cache_spec, MambaSpec)
@@ -190,7 +203,18 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             return block_size
         if self.dcp_world_size > 1:
             block_size *= self.dcp_world_size
-        if hasattr(kv_cache_spec, "compress_ratio"):
+        # Qwen4Exp's compressed QSA owner is paired with the full-attention
+        # owner in one composite block table.  Its ``block_size`` is already
+        # the logical token-block size (the physical compressed page is
+        # addressed by the QSA metadata builder), so multiplying by
+        # ``compress_ratio`` here would turn a 768-token shared block into a
+        # fictitious 3072-token scheduler block.  Standalone MLA/DSA pages
+        # (DeepSeek-V4) keep the historical logical-token scaling.
+        is_qsa_compressed = (
+            isinstance(kv_cache_spec, MLAAttentionSpec)
+            and getattr(kv_cache_spec, "model_version", None) != "deepseek_v4"
+        )
+        if hasattr(kv_cache_spec, "compress_ratio") and not is_qsa_compressed:
             compress_ratio = kv_cache_spec.compress_ratio or 1
             compress_ratio = compress_ratio if compress_ratio >= 1 else 1
             block_size *= compress_ratio
@@ -310,6 +334,15 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         while True:
             curr_hit_length = hit_length
             for idx, (spec, group_ids, manager_cls) in enumerate(self.attention_groups):
+                # Some hybrid side caches are deliberately non-persistent
+                # (for example Qwen4Exp's raw QSA circular-buffer key cache).
+                # They have a per-request ring block and therefore do not
+                # participate in prefix-cache hashing or lookup.  Calling
+                # their manager here would return a zero-length hit and the
+                # fixed-point min-over-groups algorithm would incorrectly
+                # discard valid hits from the reusable attention/state groups.
+                if not _uses_prefix_cache_hashes(spec):
+                    continue
                 effective_block_size = self._get_effective_block_size(spec)
                 first_group_id = group_ids[0]
                 cached_blocks = hit_blocks_by_group[first_group_id]
@@ -392,7 +425,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         for idx, (spec, group_ids, manager_cls) in enumerate(self.attention_groups):
             # The connector transfers Mamba state separately; report only the
             # independently reusable attention-group prefixes on this path.
-            if isinstance(spec, MambaSpec):
+            if isinstance(spec, MambaSpec) or not _uses_prefix_cache_hashes(spec):
                 continue
 
             hit_result = manager_cls.find_longest_cache_hit(

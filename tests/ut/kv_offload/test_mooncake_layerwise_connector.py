@@ -21,6 +21,11 @@ fake_torch_npu.npu.current_device = MagicMock(return_value=0)  # type: ignore[at
 fake_torch_npu.npu.Stream = MagicMock  # type: ignore[attr-defined]
 fake_torch_npu.npu_fusion_attention = MagicMock()  # type: ignore[attr-defined]
 sys.modules.setdefault("torch_npu", fake_torch_npu)
+# Swapping in the fake torch_npu.npu is process-global and permanently breaks
+# every later test module that makes real device calls (mooncake bind tests,
+# QSA graph tests). The real module is restored after this file's imports
+# complete (see the try/finally around the connector import below).
+_real_torch_npu = torch.npu  # type: ignore[attr-defined]
 torch.npu = fake_torch_npu.npu  # type: ignore[attr-defined]
 fake_uvloop = types.ModuleType("uvloop")
 fake_uvloop.__spec__ = importlib.util.spec_from_loader("uvloop", loader=None)
@@ -70,6 +75,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
 # For keys that our real import loaded, overwrite with the saved mock.
 for _k, _v in _saved_modules.items():
     sys.modules[_k] = _v
+
+# Restore the real torch_npu module: the fake swap above is process-global
+# and would permanently break later test modules that make real device calls.
+torch.npu = _real_torch_npu  # type: ignore[attr-defined]
 
 GET_META_MSG = b"get_meta_msg"
 DONE_SENDING_MSG = b"done_sending_msg"

@@ -46,6 +46,14 @@ def ascend_process_weights_after_loading(
             with device_loading_context(module, target_device):
                 module.process_weights_after_loading(model_config.dtype)
 
+    # Publish any Host-offloaded PLE tables and release their device copies.
+    # This runs after every checkpoint shard has landed, which is the first
+    # point the table is complete; the lookup path then reads Host memory.
+    for _, module in model.named_modules():
+        publish = getattr(module, "publish_host_table", None)
+        if publish is not None:
+            publish()
+
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
     if model_config.quantization == "torchao":

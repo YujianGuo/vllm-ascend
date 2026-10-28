@@ -55,6 +55,14 @@ class NPUCommunicator(DeviceCommunicatorBase):
         self.ca_comm = None
         self.all2all_manager = _NpuAll2AllManager()
 
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        # vllm::all_reduce has no mutable/aliased arguments and its fake
+        # implementation returns fresh storage. Preserve that contract for
+        # eager residual consumers and the compiler's graph memory planning.
+        output = input_.clone()
+        dist.all_reduce(output, group=self.device_group)
+        return output
+
     def all_to_all(
         self,
         input_: torch.Tensor,

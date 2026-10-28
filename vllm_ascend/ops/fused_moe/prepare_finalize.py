@@ -27,6 +27,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -421,6 +422,48 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             pertoken_scale=pertoken_scale,
         )
 
+    def _check_dp_allgather_preconditions(self, max_tokens_across_dp: int) -> int:
+        """Guard the cross-DP HcomAllGather against malformed padding inputs.
+
+        HCCL reports an inconsistent collective ("parameter count, local rank 20,
+        remote rank 67") only asynchronously; the engine then keeps serving silently
+        corrupted output until the next host sync crashes it (EngineCore dead). Two
+        malformed states are possible before the op is queued:
+          (1) `max_tokens_across_dp` smaller than the local token count (negative pad),
+          (2) `dp_metadata` missing while dp_world_size > 1 (max has silently fallen
+              back to the LOCAL token count, which can differ across DP ranks).
+
+        Both are handled by *raising the padding target to the local count*, which
+        makes the pad non-negative and keeps this rank's contribution self-consistent.
+        This is deliberately not fatal: killing a live engine over a suspected stale
+        ``self.num_tokens`` (see the ``TODO(fuzhihong)`` above on that state) would
+        trade an asynchronous remote error for an immediate local outage. Returns the
+        (possibly corrected) padding target.
+        """
+        if max_tokens_across_dp < self.num_tokens:
+            logger.error(
+                "MoE DP all_gather: max_tokens_across_dp (%d) < local num_tokens (%d); "
+                "a negative cross-DP pad would desynchronize the HCCL HcomAllGather. "
+                "Raising the padding target to the local count to stay self-consistent.",
+                max_tokens_across_dp,
+                self.num_tokens,
+            )
+            max_tokens_across_dp = self.num_tokens
+
+        fc = get_forward_context()
+        dp_world_size = get_dp_group().world_size
+        if dp_world_size > 1 and fc.dp_metadata is None:
+            logger.error(
+                "MoE DP all_gather: forward_context.dp_metadata is None while "
+                "dp_world_size=%d; max_tokens_across_dp has fallen back to the LOCAL "
+                "token count (%d), which can differ across DP ranks and drive the "
+                "all_gather contribution counts apart.",
+                dp_world_size,
+                self.num_tokens,
+            )
+
+        return max_tokens_across_dp
+
     def _prepare_with_dp_group(
         self,
         hidden_states: torch.Tensor,
@@ -442,6 +485,7 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
 
             self.num_tokens = hidden_states.shape[0]
+            max_tokens_across_dp = self._check_dp_allgather_preconditions(max_tokens_across_dp)
             pad_size = max_tokens_across_dp - self.num_tokens
             if pad_size > 0:
                 hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_size))
@@ -479,7 +523,9 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
 
     def all_gather_input_id_with_dp_group(self, input_ids: torch.Tensor) -> torch.Tensor:
         if self.moe_config.dp_size > 1:
-            max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
+            max_tokens_across_dp = self._check_dp_allgather_preconditions(
+                _EXTRA_CTX.max_tokens_across_dp
+            )
             pad_size = max_tokens_across_dp - self.num_tokens
             if pad_size > 0:
                 input_ids = nn.functional.pad(input_ids, (0, pad_size))

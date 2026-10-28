@@ -28,6 +28,11 @@ from typing import Any
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Keep the PLE n-gram table in mapped/pinned Host memory and read it through
+    # the device alias instead of holding it in HBM (0/1, default off). Roughly
+    # halves per-rank weight memory on this model; decode is at parity, prefill
+    # is about 1% slower. Requires mapped/pinned Host memory support.
+    "VLLM_ASCEND_PLE_HOST_OFFLOAD": lambda: bool(int(os.getenv("VLLM_ASCEND_PLE_HOST_OFFLOAD", "0"))),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
@@ -104,6 +109,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Compatibility switches for Qwen3.8 Flash-Next on older CANN/Triton images.
+    # Both are non-sensitive booleans and default to the optimized kernel paths.
+    "VLLM_ASCEND_FORCE_GDN_TORCH_FALLBACK": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_FORCE_GDN_TORCH_FALLBACK", "0"))
+    ),
+    "VLLM_ASCEND_FORCE_QSA_REFERENCE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_FORCE_QSA_REFERENCE", "0"))
+    ),
     # Use the fused CANN operator torch_npu.npu_chunk_gated_delta_rule for the
     # GDN prefill instead of the Triton chunk_gated_delta_rule pipeline.
     # Default is on; the caller additionally probes the operator at runtime and

@@ -21,9 +21,11 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_interface import AscendCircularBufferSpec
 from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
     AscendHybridKVCacheCoordinator,
     _is_deepseek_v4_kv_cache_spec,
+    _uses_prefix_cache_hashes,
     get_kv_cache_coordinator,
 )
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
@@ -123,6 +125,106 @@ def _make_coordinator_for_effective_block_size(
     return coordinator
 
 
+def test_qsa_circular_buffer_does_not_use_prefix_cache_hashes() -> None:
+    raw_qsa_spec = AscendCircularBufferSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+    full_spec = FullAttentionSpec(
+        block_size=768,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+    )
+
+    assert not _uses_prefix_cache_hashes(raw_qsa_spec)
+    assert _uses_prefix_cache_hashes(full_spec)
+
+    raw_uniform = UniformTypeKVCacheSpecs.from_specs({"raw": raw_qsa_spec})
+    assert raw_uniform is not None
+    assert not _uses_prefix_cache_hashes(raw_uniform)
+
+
+def test_non_hashable_qsa_group_does_not_zero_hybrid_prefix_hit() -> None:
+    """A non-persistent QSA raw ring must not veto reusable cache groups.
+
+    Qwen4Exp's raw indexer-key cache is a one-block circular buffer and is
+    intentionally excluded from prefix hashes.  It still appears in the
+    hybrid KV-cache group list, so feeding it to the coordinator's
+    min-over-groups lookup would return a zero hit and mask valid full-attn /
+    Mamba hits.
+    """
+
+    full_spec = FullAttentionSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    raw_spec = AscendCircularBufferSpec(
+        block_size=8,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+    )
+    mamba_spec = MambaSpec(
+        block_size=8,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+
+    class _HitManager:
+        supports_fine_grained_hash_lookup = False
+
+        @classmethod
+        def find_longest_cache_hit(cls, *, kv_cache_group_ids, max_length, **kwargs):
+            del kwargs
+            return tuple([[MagicMock() for _ in range(max_length // 8)] for _ in kv_cache_group_ids]), max_length
+
+    class _MustNotLookup:
+        supports_fine_grained_hash_lookup = False
+
+        @classmethod
+        def find_longest_cache_hit(cls, **kwargs):
+            raise AssertionError("non-hashable QSA ring must be skipped")
+
+    coordinator = AscendHybridKVCacheCoordinator.__new__(AscendHybridKVCacheCoordinator)
+    coordinator.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=full_spec),
+            SimpleNamespace(kv_cache_spec=raw_spec),
+            SimpleNamespace(kv_cache_spec=mamba_spec),
+        ]
+    )
+    coordinator.dcp_world_size = 1
+    coordinator.enable_caching = True
+    coordinator.enable_partial_hash_hits = False
+    coordinator.hash_block_size = 8
+    coordinator.scheduler_block_size = 8
+    coordinator.lcm_block_size = 8
+    coordinator.eagle_attn_group_indices = set()
+    coordinator.block_pool = MagicMock()
+    coordinator.attention_groups = [
+        (full_spec, [0], _HitManager),
+        (raw_spec, [1], _MustNotLookup),
+        (mamba_spec, [2], _HitManager),
+    ]
+
+    hit_blocks, hit_length, uncached = coordinator.find_longest_cache_hit(
+        block_hashes=[],
+        max_cache_hit_length=16,
+    )
+
+    assert hit_length == 16
+    assert uncached == 0
+    assert len(hit_blocks[0]) == 2
+    assert hit_blocks[1] == []
+    assert len(hit_blocks[2]) == 2
+
+
 @pytest.mark.parametrize(
     ("enable_prefix_caching", "expected_hash_block_size"),
     [
@@ -203,6 +305,37 @@ def test_get_effective_block_size(
     )
 
     assert coordinator._get_effective_block_size(spec_factory()) == expected
+
+
+def test_qsa_compressed_spec_keeps_logical_token_block_size() -> None:
+    coordinator = _make_coordinator_for_effective_block_size(
+        dcp_world_size=1,
+        enable_caching=True,
+    )
+    qsa_spec = MLAAttentionSpec(
+        block_size=768,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        compress_ratio=4,
+    )
+    assert coordinator._get_effective_block_size(qsa_spec) == 768
+
+
+def test_deepseek_compressed_spec_scales_logical_block_size() -> None:
+    coordinator = _make_coordinator_for_effective_block_size(
+        dcp_world_size=1,
+        enable_caching=True,
+    )
+    deepseek_spec = MLAAttentionSpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=4,
+        model_version="deepseek_v4",
+    )
+    assert coordinator._get_effective_block_size(deepseek_spec) == 512
 
 
 def test_get_kv_cache_coordinator_delegates_single_group(monkeypatch) -> None:

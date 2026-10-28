@@ -989,6 +989,44 @@ class KVDeliveryScheduler(Scheduler):
                     request.status = RequestStatus.FINISHED_ERROR
                     request.resumable = False
                     stopped = True
+                else:
+                    # The structured document is complete. Under async + spec
+                    # decoding the drafts produced after completion are not
+                    # re-validated against the grammar, so they would leak into
+                    # the output as trailing junk. Drop everything past the
+                    # completing token; the completed grammar only permits the
+                    # stop token from here on, so the request then finishes
+                    # through the normal EOS path. The KV blocks keep the
+                    # computed prefix (the tokens really were processed), so the
+                    # scheduler's accounting stays intact.
+                    completed_upto = getattr(grammar, "_completed_upto", None)
+                    if completed_upto is not None and completed_upto < len(advance_token_ids):
+                        dropped = len(advance_token_ids) - completed_upto
+                        # Never trim away a trailing stop token. When the step
+                        # ends with EOS, check_stop has already matched it and
+                        # marked the request FINISHED_STOPPED. The API layer
+                        # then elides the stop token by looking at the *last*
+                        # token of the batch, so removing EOS here leaves the
+                        # last content token (e.g. the closing ``}`` of a JSON
+                        # document) looking like the stop token, and the
+                        # response is truncated by one token. Drop only the
+                        # post-completion junk between the completing token and
+                        # the stop token.
+                        keep_tail = 0
+                        sampling_params = request.sampling_params
+                        if sampling_params is not None:
+                            last_token = new_token_ids[-1]
+                            if last_token == sampling_params.eos_token_id or last_token in (
+                                sampling_params.stop_token_ids or ()
+                            ):
+                                keep_tail = 1
+                        drop_count = dropped - keep_tail
+                        if drop_count > 0:
+                            drop_start = len(new_token_ids) - dropped
+                            del new_token_ids[drop_start : drop_start + drop_count]
+                            del request._output_token_ids[
+                                drop_start : drop_start + drop_count
+                            ]
 
             routed_experts = None
             if self.enable_return_routed_experts and routing_data is not None and new_token_ids:

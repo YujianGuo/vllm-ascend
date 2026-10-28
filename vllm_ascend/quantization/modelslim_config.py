@@ -94,6 +94,27 @@ packed_modules_model_mapping: dict[str, dict[str, list[str]]] = {
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
         "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
     },
+    # Qwen4Exp: MoE hybrid of QSA (self_attn) and GatedDeltaNet (linear_attn)
+    # layers with HyperConnection mixers. The fused-module set mirrors the
+    # model class's packed_modules_mapping (qsa.py / model.py / mtp.py), plus
+    # "experts" so the routed-expert FusedMoE module resolves its shards.
+    # The HyperConnection mixers are built with quant_config=None (they are
+    # always FLOAT), so "input_mix_weight_down_block_inject" is intentionally
+    # not listed here.
+    "qwen4_exp": {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
+    },
+    "qwen4_exp_mtp": {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
+    },
     "deepseek_v2": {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
@@ -663,6 +684,16 @@ class AscendModelSlimConfig(QuantizationConfig):
                 for candidate in (prefix.replace("model.layers.", "language_model.model.layers.", 1),):
                     if self._has_quant_weight(candidate, packed_modules_mapping):
                         return candidate
+        if model_type == "qwen4_exp_mtp" and prefix.startswith("mtp.layers."):
+            # The Qwen4Exp MTP drafter numbers its decoder blocks from the
+            # target model's num_hidden_layers (e.g. "mtp.layers.48"), while
+            # the quant description keeps the checkpoint-relative index
+            # ("mtp.layers.0"). Rewrite the query to the description index.
+            packed_modules_mapping = get_packed_modules_mapping(model_type)
+            if not self._has_quant_weight(prefix, packed_modules_mapping):
+                candidate = re.sub(r"^mtp\.layers\.\d+", "mtp.layers.0", prefix)
+                if self._has_quant_weight(candidate, packed_modules_mapping):
+                    return candidate
         return prefix
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str, tid2eid=None) -> Optional["QuantizeMethodBase"]:
@@ -862,8 +893,15 @@ class AscendModelSlimConfig(QuantizationConfig):
 
         # If quant_description is already populated (e.g. from from_config()),
         # there is nothing to do.
-        if self.quant_description:
+        if self.quant_description and len(self.quant_description) > 2:
             return
+
+        # A config.json "quantization_config": {"quant_method": "ascend",
+        # "model_quant_type": ...} block is parsed by vLLM as the quant config
+        # (from_config), so quant_description initially holds only those few
+        # metadata keys. The full per-layer description still has to be loaded
+        # from quant_model_description.json.
+        base_description = self.quant_description if self.quant_description else {}
 
         # Try to get the config file (local or remote)
         config_path = get_model_file(model_name, MODELSLIM_CONFIG_FILENAME, revision=revision)
@@ -871,6 +909,9 @@ class AscendModelSlimConfig(QuantizationConfig):
         if config_path is not None:
             with open(config_path) as f:
                 self.quant_description = json.load(f)
+            if base_description:
+                for key, value in base_description.items():
+                    self.quant_description.setdefault(key, value)
             self._apply_extra_quant_adaptations()
             self._add_kvcache_quant_metadata()
             return
@@ -981,6 +1022,23 @@ class AscendModelSlimConfig(QuantizationConfig):
                     new_name = name.replace("embed", "embed_tokens")
                 extra_quant_dict[new_name] = self.quant_description[name]
             self.quant_description.update(extra_quant_dict)
+
+        # Qwen4Exp MTP checkpoints describe the draft expert weights as
+        # module-level fused tensors without a shard index or ".weight"
+        # suffix (e.g. "mtp.layers.0.mlp.experts.gate_up_proj"). The FusedMoE
+        # module and the skip-check resolve per-shard keys instead
+        # ("...experts.0.gate_proj.weight"), so expand them.
+        extra_quant_dict = {}
+        for k, v in self.quant_description.items():
+            m = re.fullmatch(r"(mtp\.layers\.\d+\.mlp\.experts)\.(gate_up_proj|down_proj)", k)
+            if m:
+                base, proj = m.groups()
+                if proj == "gate_up_proj":
+                    extra_quant_dict[f"{base}.0.gate_proj.weight"] = v
+                    extra_quant_dict[f"{base}.0.up_proj.weight"] = v
+                else:
+                    extra_quant_dict[f"{base}.0.down_proj.weight"] = v
+        self.quant_description.update(extra_quant_dict)
 
         extra_quant_dict = {}
         for k in self.quant_description:

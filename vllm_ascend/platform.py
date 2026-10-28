@@ -1056,13 +1056,41 @@ class NPUPlatform(Platform):
         model_config = vllm_config.model_config
         # ==================== 1. Model Config ====================
         if model_config:
-            # Disable Cascade Attention (GPU feature)
-            if getattr(model_config, "disable_cascade_attn", False):
+            # Disable Cascade Attention. It is a GPU-only implementation: no
+            # Ascend attention metadata carries a `use_cascade` flag and no
+            # Ascend kernel loads a cascade prefix, so there is nothing here to
+            # enable. Leaving it on is actively harmful, because the inherited
+            # dispatch decision still runs: `_compute_cascade_attn_prefix_lens`
+            # reports a prefix whenever any KV cache group shares a block (the
+            # scheduler emits e.g. [0, 1, 0, 0, 0, 0] during pure decode once
+            # prefix caching is on), and `_determine_batch_execution_and_padding`
+            # turns that into `invalid_modes={CUDAGraphMode.FULL}`. Under
+            # FULL_DECODE_ONLY no PIECEWISE keys are ever captured
+            # (`mixed_mode()` is NONE), so the dispatcher is left with no mode
+            # and returns NONE: the batch silently drops off the ACL graph and
+            # runs eager. Measured on Qwen3.8-Flash-Next, N=16 sharing a 3200
+            # token prefix: 145-230 s for 9600 tokens (289-394 ms TPOT) versus
+            # 42 s (63 ms TPOT) with cascade off -- a 3.9x regression for a
+            # feature that does nothing on this platform.
+            #
+            # The config default is already True (`vllm/config/model.py`), and
+            # vLLM also sets it True for speculative decoding combined with
+            # async scheduling ("not yet compatible with async speculative
+            # decoding"). `--disable-cascade-attn` is a
+            # `argparse.BooleanOptionalAction`, so `--no-disable-cascade-attn`
+            # is what a user would have to pass to reach False. This hook runs
+            # from `VllmConfig.__post_init__` *after* those, and an earlier
+            # version of this block reset the flag to False whenever it was
+            # True. Because True is the default, that fired on every Ascend run
+            # and unconditionally enabled cascade attention -- it was never a
+            # "user asked for it" path.
+            if not getattr(model_config, "disable_cascade_attn", True):
                 logger.warning(
-                    "GPU-specific parameter is not supported on Ascend. "
-                    "parameter=disable_cascade_attn, value=True, action: resetting to False."
+                    "Disabling cascade attention: it is not implemented on "
+                    "Ascend, and requesting it forces decode batches to fall "
+                    "back to eager execution (off the ACL graph)."
                 )
-                model_config.disable_cascade_attn = False
+                model_config.disable_cascade_attn = True
 
         # ==================== 2. Cache Config ====================
         if vllm_config.cache_config:

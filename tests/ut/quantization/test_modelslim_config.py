@@ -740,6 +740,120 @@ class TestQuantPrefixMapper(TestBase):
 
         self.assertEqual(prefix, "model.layers.0.moe.experts")
 
+    def test_qwen4_exp_packed_modules_mapping_covers_attention_mlp_and_moe(self):
+        expected_mapping = {
+            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+            "gate_up_proj": ["gate_proj", "up_proj"],
+            "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+            "in_proj_ba": ["in_proj_b", "in_proj_a"],
+            "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
+        }
+        for model_type in ("qwen4_exp", "qwen4_exp_mtp"):
+            with self.subTest(model_type=model_type):
+                self.assertEqual(get_packed_modules_mapping(model_type), expected_mapping)
+
+    def test_qwen4_exp_quantized_layers_resolve_w8a8(self):
+        quant_description = {
+            "language_model.model.layers.3.self_attn.q_proj.weight": "W8A8_DYNAMIC",
+            "language_model.model.layers.3.self_attn.k_proj.weight": "W8A8_DYNAMIC",
+            "language_model.model.layers.3.self_attn.v_proj.weight": "W8A8_DYNAMIC",
+            "language_model.model.layers.3.self_attn.o_proj.weight": "W8A8_DYNAMIC",
+            "language_model.model.layers.0.mlp.experts.0.gate_proj.weight": "W8A8_DYNAMIC",
+            "language_model.model.layers.0.mlp.experts.0.up_proj.weight": "W8A8_DYNAMIC",
+            "language_model.model.layers.0.mlp.experts.0.down_proj.weight": "W8A8_DYNAMIC",
+        }
+        config = AscendModelSlimConfig(quant_description)
+        packed_mapping = get_packed_modules_mapping("qwen4_exp")
+
+        self.assertFalse(
+            config.is_layer_skipped_ascend("language_model.model.layers.3.self_attn.qkv_proj", packed_mapping)
+        )
+        self.assertEqual(
+            get_linear_quant_type(
+                quant_description, "language_model.model.layers.3.self_attn.qkv_proj", packed_mapping
+            ),
+            "W8A8_DYNAMIC",
+        )
+        self.assertFalse(config.is_layer_skipped_ascend("language_model.model.layers.0.mlp.experts", packed_mapping))
+
+    def test_qwen4_exp_float_layers_are_skipped(self):
+        quant_description = {
+            "language_model.model.layers.0.linear_attn.in_proj_qkv.weight": "FLOAT",
+            "language_model.model.layers.0.linear_attn.in_proj_z.weight": "FLOAT",
+            "language_model.model.layers.0.linear_attn.in_proj_b.weight": "FLOAT",
+            "language_model.model.layers.0.linear_attn.in_proj_a.weight": "FLOAT",
+            "language_model.model.layers.0.linear_attn.out_proj.weight": "FLOAT",
+            "language_model.model.layers.0.mlp.gate.weight": "FLOAT",
+            "language_model.lm_head.weight": "FLOAT",
+        }
+        config = AscendModelSlimConfig(quant_description)
+        packed_mapping = get_packed_modules_mapping("qwen4_exp")
+
+        self.assertTrue(
+            config.is_layer_skipped_ascend("language_model.model.layers.0.linear_attn.in_proj_qkvz", packed_mapping)
+        )
+        self.assertTrue(
+            config.is_layer_skipped_ascend("language_model.model.layers.0.linear_attn.in_proj_ba", packed_mapping)
+        )
+        self.assertTrue(
+            config.is_layer_skipped_ascend("language_model.model.layers.0.linear_attn.out_proj", packed_mapping)
+        )
+        self.assertTrue(config.is_layer_skipped_ascend("language_model.model.layers.0.mlp.gate", packed_mapping))
+        self.assertTrue(config.is_layer_skipped_ascend("language_model.lm_head", packed_mapping))
+
+    def test_qwen4_exp_mtp_expert_module_keys_are_expanded(self):
+        # Qwen4Exp MTP checkpoints describe the draft expert weights as
+        # module-level fused tensors without shard index or ".weight" suffix.
+        quant_description = {
+            "mtp.layers.0.mlp.experts.gate_up_proj": "FLOAT",
+            "mtp.layers.0.mlp.experts.down_proj": "FLOAT",
+            "mtp.layers.0.mlp.gate.weight": "FLOAT",
+        }
+        config = AscendModelSlimConfig(quant_description)
+
+        self.assertEqual(config.quant_description.get("mtp.layers.0.mlp.experts.0.gate_proj.weight"), "FLOAT")
+        self.assertEqual(config.quant_description.get("mtp.layers.0.mlp.experts.0.up_proj.weight"), "FLOAT")
+        self.assertEqual(config.quant_description.get("mtp.layers.0.mlp.experts.0.down_proj.weight"), "FLOAT")
+
+        packed_mapping = get_packed_modules_mapping("qwen4_exp_mtp")
+        self.assertTrue(config.is_layer_skipped_ascend("mtp.layers.0.mlp.experts", packed_mapping))
+
+    def test_qwen4_exp_mtp_layer_index_is_remapped_to_description(self):
+        # The drafter numbers its decoder blocks from the target model's
+        # num_hidden_layers; the quant description keeps layer 0.
+        quant_description = {
+            "mtp.layers.0.self_attn.q_proj.weight": "FLOAT",
+            "mtp.layers.0.self_attn.k_proj.weight": "FLOAT",
+            "mtp.layers.0.self_attn.v_proj.weight": "FLOAT",
+            "mtp.layers.0.mlp.gate.weight": "FLOAT",
+        }
+        config = AscendModelSlimConfig(quant_description)
+        packed_mapping = get_packed_modules_mapping("qwen4_exp_mtp")
+
+        prefix = config.quant_prefix_mapper("qwen4_exp_mtp", "mtp.layers.48.self_attn.qkv_proj")
+        self.assertEqual(prefix, "mtp.layers.0.self_attn.qkv_proj")
+        self.assertTrue(config.is_layer_skipped_ascend(prefix, packed_mapping))
+
+        prefix = config.quant_prefix_mapper("qwen4_exp_mtp", "mtp.layers.48.mlp.gate")
+        self.assertEqual(prefix, "mtp.layers.0.mlp.gate")
+
+    def test_qwen4_exp_mtp_prefix_unchanged_when_key_directly_present(self):
+        quant_description = {
+            "mtp.layers.48.self_attn.q_proj.weight": "W8A8_DYNAMIC",
+            "mtp.layers.48.self_attn.k_proj.weight": "W8A8_DYNAMIC",
+            "mtp.layers.48.self_attn.v_proj.weight": "W8A8_DYNAMIC",
+        }
+        config = AscendModelSlimConfig(quant_description)
+
+        prefix = config.quant_prefix_mapper("qwen4_exp_mtp", "mtp.layers.48.self_attn.qkv_proj")
+        self.assertEqual(prefix, "mtp.layers.48.self_attn.qkv_proj")
+
+    def test_other_model_types_do_not_get_mtp_layer_remap(self):
+        config = AscendModelSlimConfig({"mtp.layers.0.mlp.gate.weight": "FLOAT"})
+
+        prefix = config.quant_prefix_mapper("qwen3_5_moe", "mtp.layers.48.mlp.gate")
+        self.assertEqual(prefix, "mtp.layers.48.mlp.gate")
+
 
 class TestGetKvQuantDtype(TestBase):
     def test_enable_fa_quant(self):

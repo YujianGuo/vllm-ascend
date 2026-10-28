@@ -36,9 +36,14 @@ class BlockTable:
             and hasattr(kv_cache_group, "kv_cache_spec")
             and isinstance(kv_cache_group.kv_cache_spec, UniformTypeKVCacheSpecs)
         ):
-            kv_cache_spec = next(iter(kv_cache_group.kv_cache_spec.kv_cache_specs.values()), None)
-            if kv_cache_spec is not None and hasattr(kv_cache_spec, "compress_ratio"):
-                compress_ratio = kv_cache_spec.compress_ratio
+            # A shared table must hold blocks for every owner. QSA groups
+            # full K/V and compressed index keys under the same physical IDs;
+            # choosing an arbitrary compressed owner shrinks the table by 4
+            # and makes capacity depend on dictionary insertion order.
+            compress_ratio = min(
+                (getattr(spec, "compress_ratio", 1) for spec in kv_cache_group.kv_cache_spec.kv_cache_specs.values()),
+                default=1,
+            )
         if (
             kv_cache_group is not None
             and hasattr(kv_cache_group, "kv_cache_spec")

@@ -96,6 +96,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `rejection_sampler_config`          | dict | `{}`    | Configuration options for rejection sampler (block verify and entropy verify). |
 | `multistream_dsv4_dsa_overlap`      | bool | `True`  | Whether to enable dsa multi-stream overlap for DeepSeek V4.  |
 | `enable_reduce_sample`              | bool | `False` | Whether to enable reduce sample optimization to reduce communication and computation overheads in the tensor parallelism scenario. When enabled, logits are kept partitioned across TP ranks and only the small set of top-k candidate values/indices is communicated, instead of performing a full-vocabulary all-to-all/all-gather. |
+| `qwen_mtp_repeated_proposals`        | bool | `False` | Experimental Qwen4Exp MTP candidate selection for greedy decoding with DCP size 1. When two adjacent committed target tokens match, propose repetitions of that token. MTP still runs the configured number of draft steps, and every candidate must pass target verification. Other requests retain MTP candidates. Gains depend on repetition in the workload; this is an MTP plus repetition strategy. |
 
 The details of each configuration option are as follows:
 

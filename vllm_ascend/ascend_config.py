@@ -345,6 +345,12 @@ class AscendConfig:
         # Enable optimized reduce sampling scheme
         self.enable_reduce_sample = additional_config.get("enable_reduce_sample", False)
 
+        # Opt-in Qwen MTP candidate selection for repeated committed tokens.
+        # Greedy requests only; all candidates still require target verification.
+        self.qwen_mtp_repeated_proposals = additional_config.get("qwen_mtp_repeated_proposals", False)
+        if not isinstance(self.qwen_mtp_repeated_proposals, bool):
+            raise ValueError("qwen_mtp_repeated_proposals must be a boolean")
+
         self.mix_placement = additional_config.get("mix_placement", False)
         self._check_mix_placement()
 

@@ -1086,3 +1086,36 @@ class TestNPUPlatform(TestBase):
             self.platform.get_static_graph_wrapper_cls(),
             "vllm_ascend.compilation.acl_graph.ACLGraphWrapper",
         )
+
+    def test_fix_incompatible_config_disables_cascade_attention(self):
+        """`--no-disable-cascade-attn` must not re-enable it on Ascend.
+
+        Cascade attention is GPU-only here, and requesting it forces decode
+        batches off the ACL graph (a 3.9x TPOT regression once prefixes are
+        shared), so an explicit opt-in is overridden rather than honoured.
+        """
+        vllm_config = MagicMock()
+        vllm_config.model_config.disable_cascade_attn = False
+        NPUPlatform._fix_incompatible_config(vllm_config)
+        self.assertTrue(vllm_config.model_config.disable_cascade_attn)
+
+    def test_fix_incompatible_config_default_enables_no_cascade(self):
+        """The real-world path: the default is True, so cascade never turns on.
+
+        The old block fired on this exact value (it tested
+        `if disable_cascade_attn:` and then set it to False) and so enabled
+        cascade attention on every Ascend run.
+        """
+        vllm_config = MagicMock()
+        vllm_config.model_config.disable_cascade_attn = True
+        NPUPlatform._fix_incompatible_config(vllm_config)
+        self.assertTrue(vllm_config.model_config.disable_cascade_attn)
+        # And the runner derives its flag from the config, so it stays off.
+        self.assertFalse(not vllm_config.model_config.disable_cascade_attn)
+
+    def test_fix_incompatible_config_keeps_cascade_attention_disabled(self):
+        """A config that already disabled it must stay disabled (no-op)."""
+        vllm_config = MagicMock()
+        vllm_config.model_config.disable_cascade_attn = True
+        NPUPlatform._fix_incompatible_config(vllm_config)
+        self.assertTrue(vllm_config.model_config.disable_cascade_attn)

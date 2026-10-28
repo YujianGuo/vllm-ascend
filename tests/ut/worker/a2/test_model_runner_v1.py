@@ -115,6 +115,154 @@ class TestNPUModelRunnerHiddenStateGather(unittest.TestCase):
         mock_all_gather.assert_not_called()
 
 
+class TestNPUModelRunnerAcceptedTokens(unittest.TestCase):
+    def test_input_prep_waits_for_postprocess_before_reusing_shared_buffers(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        actions = []
+        runner.num_accepted_tokens_event = MagicMock()
+        runner.num_accepted_tokens_event.synchronize.side_effect = lambda: actions.append("postprocess_done")
+        runner.prepare_inputs_event = MagicMock()
+        runner.prepare_inputs_event.synchronize.side_effect = lambda: actions.append("h2d_done")
+        runner.prepare_inputs_event.record.side_effect = lambda: actions.append("h2d_record")
+        runner._mamba_state_update_pending = True
+
+        with runner.synchronize_input_prep():
+            actions.append("reuse_block_table_and_metadata")
+        self.assertEqual(actions, ["postprocess_done", "h2d_done", "reuse_block_table_and_metadata", "h2d_record"])
+        self.assertFalse(runner._mamba_state_update_pending)
+        # A following dummy/draft preparation without a new state update must
+        # not wait on a stale accepted-token event a second time.
+        with runner.synchronize_input_prep():
+            pass
+        runner.num_accepted_tokens_event.synchronize.assert_called_once()
+
+    def test_input_prep_without_postprocess_keeps_existing_event_protocol(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.num_accepted_tokens_event = MagicMock()
+        runner.prepare_inputs_event = None
+        runner._mamba_state_update_pending = False
+        with runner.synchronize_input_prep():
+            pass
+        runner.num_accepted_tokens_event.synchronize.assert_not_called()
+
+    @patch(
+        "vllm_ascend.worker.model_runner_v1.mamba_utils."
+        "postprocess_mamba_align_gpu"
+    )
+    def test_async_postprocess_writes_independent_snapshot(
+        self, mock_postprocess
+    ):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.use_async_scheduling = True
+        runner.speculative_config = object()
+        runner.model_config = SimpleNamespace(is_hybrid=True)
+        runner.cache_config = SimpleNamespace(mamba_cache_mode="align")
+        runner.num_accepted_tokens = SimpleNamespace(
+            cpu=torch.zeros(2, dtype=torch.int32),
+            gpu=torch.zeros(2, dtype=torch.int32),
+        )
+        persistent_counts = torch.ones(2, dtype=torch.int32)
+        runner.input_batch = SimpleNamespace(
+            num_accepted_tokens_cpu_tensor=persistent_counts
+        )
+        runner.kv_cache_config = object()
+        runner.compilation_config = SimpleNamespace(static_forward_context={})
+        runner.num_accepted_tokens_event = MagicMock()
+        runner._get_mamba_bufs = MagicMock()
+        runner._get_mamba_state_copy_funcs = MagicMock(return_value={})
+
+        runner._update_states_after_model_execute(
+            torch.tensor([[10, 11, -1], [20, -1, -1]]),
+            MagicMock(),
+        )
+
+        self.assertIs(
+            mock_postprocess.call_args.kwargs[
+                "num_accepted_tokens_cpu_tensor"
+            ],
+            runner.num_accepted_tokens.cpu,
+        )
+        self.assertIsNot(
+            mock_postprocess.call_args.kwargs[
+                "num_accepted_tokens_cpu_tensor"
+            ],
+            persistent_counts,
+        )
+        runner.num_accepted_tokens_event.record.assert_called_once_with()
+        self.assertTrue(runner._mamba_state_update_pending)
+
+    @patch(
+        "vllm_ascend.worker.model_runner_v1.GPUModelRunner."
+        "_update_states_after_model_execute",
+        autospec=True,
+    )
+    def test_non_async_postprocess_delegates_to_upstream(
+        self, mock_postprocess
+    ):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.use_async_scheduling = False
+        output_token_ids = torch.tensor([[10, -1]])
+        scheduler_output = MagicMock()
+
+        runner._update_states_after_model_execute(
+            output_token_ids, scheduler_output
+        )
+
+        mock_postprocess.assert_called_once_with(
+            runner, output_token_ids, scheduler_output
+        )
+
+    def test_async_remap_uses_snapshot_after_batch_row_is_overwritten(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        previous_counts = np.ones(16, dtype=np.int32)
+        previous_counts[4] = 3
+        previous_counts[11] = 4
+        persistent_counts = np.ones(16, dtype=np.int32)
+        runner.num_accepted_tokens = SimpleNamespace(np=previous_counts)
+        runner.prev_positions = SimpleNamespace(
+            np=np.array([11, -1, 4] + [-1] * 13, dtype=np.int64)
+        )
+        runner.input_batch = SimpleNamespace(
+            num_accepted_tokens_cpu=persistent_counts
+        )
+        runner.use_async_scheduling = True
+
+        runner._sync_num_accepted_tokens(3, has_prev_mapping=True)
+
+        np.testing.assert_array_equal(previous_counts[:3], [4, 1, 3])
+        np.testing.assert_array_equal(persistent_counts[:3], [4, 1, 3])
+
+    def test_async_without_previous_mapping_initializes_current_rows(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        snapshot = np.array([0, 4, 3, 9], dtype=np.int32)
+        persistent_counts = np.array([7, 8, 6, 5], dtype=np.int32)
+        runner.num_accepted_tokens = SimpleNamespace(np=snapshot)
+        runner.input_batch = SimpleNamespace(
+            num_accepted_tokens_cpu=persistent_counts
+        )
+        runner.use_async_scheduling = True
+
+        runner._sync_num_accepted_tokens(3, has_prev_mapping=False)
+
+        np.testing.assert_array_equal(snapshot, [1, 1, 1, 9])
+        np.testing.assert_array_equal(persistent_counts, [1, 1, 1, 5])
+
+    def test_non_async_sync_uses_condensed_input_batch_rows(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        snapshot = np.array([4, 2, 9], dtype=np.int32)
+        persistent_counts = np.array([2, 1, 7], dtype=np.int32)
+        runner.num_accepted_tokens = SimpleNamespace(np=snapshot)
+        runner.input_batch = SimpleNamespace(
+            num_accepted_tokens_cpu=persistent_counts
+        )
+        runner.use_async_scheduling = False
+
+        runner._sync_num_accepted_tokens(2, has_prev_mapping=False)
+
+        np.testing.assert_array_equal(snapshot, [2, 1, 9])
+        np.testing.assert_array_equal(persistent_counts, [2, 1, 7])
+
+
 class TestDSparkAuxCaptureMode(unittest.TestCase):
     def _build_runner(
         self,
@@ -213,6 +361,42 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         self.assertEqual(k_cache_raw.numel(), kv_cache_spec.page_size_bytes)
         self.assertEqual(v_cache_raw.numel(), kv_cache_spec.page_size_bytes)
+
+    def test_allocate_packed_kv_cache_reuses_one_backing(self):
+        runner = self._build_runner()
+        layer_names = ["model.layers.0.attn", "model.layers.1.attn"]
+        layer_specs = {
+            name: FullAttentionSpec(
+                block_size=2,
+                num_kv_heads=1,
+                head_size=4,
+                dtype=torch.bfloat16,
+            )
+            for name in layer_names
+        }
+        runner._get_layer_kv_cache_specs = MagicMock(return_value=layer_specs)
+        total_size = 128
+        block_stride = 32
+        kv_cache_config = KVCacheConfig(
+            num_blocks=total_size // block_stride,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=total_size,
+                    shared_by=[name],
+                    offset=index * 16,
+                    block_stride=block_stride,
+                )
+                for index, name in enumerate(layer_names)
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=layer_specs[layer_names[0]])
+            ],
+        )
+
+        raw_caches = runner._allocate_kv_cache_tensors(kv_cache_config)
+
+        self.assertIs(raw_caches[layer_names[0]], raw_caches[layer_names[1]])
+        self.assertEqual(raw_caches[layer_names[0]].numel(), total_size)
 
     def test_get_layer_kv_cache_specs_restores_sfa_indexer_spec(self):
         runner = self._build_runner()
@@ -764,6 +948,69 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(indexer_scale_cache.dtype, torch.float16)
 
 
+class TestQwen4ExpPleInputs(unittest.TestCase):
+    def _build_runner(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.model_config = SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                ple_layer_ids=[0],
+                ngram_size=3,
+                eos_token_id=999,
+            )
+        )
+        runner.max_num_reqs = 2
+        runner.device = torch.device("cpu")
+        runner._qwen4_exp_ngram_context_buffer = None
+        runner._qwen4_exp_query_start_loc_buffer = None
+        runner.input_ids = SimpleNamespace(gpu=torch.tensor([5], dtype=torch.int32))
+        runner.query_start_loc = SimpleNamespace(
+            gpu=torch.tensor([0, 1], dtype=torch.int32)
+        )
+        runner.input_batch = SimpleNamespace(
+            req_ids=["req0"],
+            num_computed_tokens_cpu=np.array([3], dtype=np.int32),
+            token_ids_cpu=np.array([[7, 8, 9, 0]], dtype=np.int32),
+        )
+        return runner
+
+    def test_ngram_context_keeps_address_and_refreshes_values(self):
+        runner = self._build_runner()
+        dummy_kwargs = {}
+        runner._maybe_add_qwen4_exp_ple_inputs(
+            dummy_kwargs,
+            num_tokens=1,
+            num_reqs=1,
+            num_reqs_padded=1,
+            is_dummy=True,
+        )
+        dummy_context = dummy_kwargs["ngram_context"]
+        stable_ptr = dummy_context.data_ptr()
+        self.assertEqual(dummy_context.tolist(), [[999, 999], [999, 999]])
+
+        real_kwargs = {}
+        runner._maybe_add_qwen4_exp_ple_inputs(
+            real_kwargs,
+            num_tokens=1,
+            num_reqs=1,
+            num_reqs_padded=1,
+        )
+        real_context = real_kwargs["ngram_context"]
+        self.assertEqual(real_context.data_ptr(), stable_ptr)
+        self.assertEqual(real_context.tolist(), [[8, 9], [999, 999]])
+
+        external = torch.tensor([[33, 44]], dtype=torch.int32)
+        external_kwargs = {"ngram_context": external}
+        runner._maybe_add_qwen4_exp_ple_inputs(
+            external_kwargs,
+            num_tokens=1,
+            num_reqs=1,
+            num_reqs_padded=1,
+        )
+        copied_context = external_kwargs["ngram_context"]
+        self.assertEqual(copied_context.data_ptr(), stable_ptr)
+        self.assertEqual(copied_context.tolist(), [[33, 44], [999, 999]])
+
+
 class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
     def _build_runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)
@@ -798,6 +1045,9 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
         input_batch.sampled_token_ids_cpu = torch.tensor([6, 7])
         input_batch.async_copy_ready_event = MagicMock()
         input_batch.async_copy_ready_event.synchronize = MagicMock()
+        # RNG-offset preservation for discarded prefills (see _sample); no
+        # discarded requests in this test.
+        input_batch.generators = {}
 
         # Simulate the real behavior of InputBatch.update_async_output_token_ids
         def mock_update_output_token_ids():
@@ -816,6 +1066,11 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
         runner = self._build_runner()
         runner.input_batch = input_batch
         runner.sampler = MagicMock(return_value=MagicMock())
+        # RNG-offset preservation for discarded prefills (see _sample); no
+        # discarded requests in this test.
+        runner.discard_request_indices = MagicMock()
+        runner.discard_request_indices.np.__getitem__.return_value = []
+        runner.num_discarded_requests = 0
 
         # Call sample method
         logits = torch.randn(2, 32000)
@@ -1069,6 +1324,72 @@ class TestCorrectOptimisticSeqLensCpu(unittest.TestCase):
         runner.valid_sampled_token_count_event = None
         with self.assertRaises(AssertionError):
             runner._correct_optimistic_seq_lens_cpu(1)
+
+
+class TestQwenDraftDPSyncReuse(unittest.TestCase):
+    def test_uniform_draft_reuses_global_capacity(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.dp_size = 2
+        runner._qwen_uniform_target_shape = (32, torch.tensor([32, 32], dtype=torch.int32), 8)
+        with patch("vllm_ascend.worker.model_runner_v1.dist.all_reduce") as collective:
+            result = runner._sync_metadata_across_dp(16, is_draft_model=True, draft_batch_size=4)
+        collective.assert_not_called()
+        self.assertEqual(result[0], 32)
+        self.assertEqual(result[3], 8)
+        self.assertEqual(result[1].tolist(), [32, 32])
+
+    def test_target_and_mixed_draft_do_not_use_cached_capacity(self):
+        for is_draft, cached in ((False, (32, torch.tensor([32, 32]), 8)), (True, None)):
+            runner = NPUModelRunner.__new__(NPUModelRunner)
+            runner.dp_size = 2
+            runner.dp_rank = 0
+            runner.vllm_config = MagicMock()
+            runner.speculative_config = MagicMock()  # MTP-on
+            runner._qwen_uniform_target_shape = cached
+            with (
+                patch("vllm_ascend.worker.model_runner_v1.should_skip_allreduce_across_dp_group", return_value=False),
+                patch("vllm_ascend.worker.model_runner_v1.get_dp_group"),
+                patch("vllm_ascend.worker.model_runner_v1.dist.all_reduce") as collective,
+            ):
+                runner._sync_metadata_across_dp(16, is_draft_model=is_draft)
+            # MTP-on stays at the original single DP-pair all_reduce: the
+            # EP-wide MAX reduce is gated on speculative_config being None, so
+            # the MTP-on path must be untouched (Issue A's core promise).
+            collective.assert_called_once()
+
+    def test_ep_wide_max_reduce_is_mtp_off_only(self):
+        """Issue A: per-DP-pair MAX is insufficient for the 16-wide EP ring.
+
+        Per-pair local maxima can disagree across nodes (measured 20 on one
+        node vs 67 on the other), leaving the ``group_name_3`` HcomAllGather
+        misaligned. MTP-off therefore adds a second MAX all_reduce over the full
+        EP group; MTP-on takes the FULL_DECODE bucket path and must not issue it.
+        """
+        def run(spec_cfg):
+            runner = NPUModelRunner.__new__(NPUModelRunner)
+            runner.dp_size = 2
+            runner.dp_rank = 0
+            runner.vllm_config = MagicMock()
+            runner.speculative_config = spec_cfg
+            runner._qwen_uniform_target_shape = None
+            with (
+                patch("vllm_ascend.worker.model_runner_v1.should_skip_allreduce_across_dp_group", return_value=False),
+                patch("vllm_ascend.worker.model_runner_v1.get_dp_group"),
+                patch("vllm_ascend.worker.model_runner_v1.get_ep_group") as ep_group,
+                patch("vllm_ascend.worker.model_runner_v1.dist.all_reduce") as collective,
+            ):
+                runner._sync_metadata_across_dp(16, is_draft_model=False)
+            return collective, ep_group
+
+        # MTP-off: DP-pair reduce + EP-wide MAX reduce.
+        collective, ep_group = run(None)
+        self.assertEqual(collective.call_count, 2)
+        self.assertEqual(ep_group.call_count, 1, "MTP-off must reach the EP group")
+
+        # MTP-on: DP-pair reduce only; the EP group is never consulted.
+        collective, ep_group = run(MagicMock())
+        self.assertEqual(collective.call_count, 1)
+        self.assertEqual(ep_group.call_count, 0, "MTP-on path must stay untouched")
 
 
 if __name__ == "__main__":

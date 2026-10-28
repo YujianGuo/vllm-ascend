@@ -109,6 +109,7 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.enable_kv_nz)
         self.assertEqual(ascend_config.mega_moe_max_tokens, 65536)
+        self.assertFalse(ascend_config.qwen_mtp_repeated_proposals)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -132,11 +133,13 @@ class TestAscendConfig(TestBase):
             "refresh": True,
             "enable_kv_nz": False,
             "mega_moe_max_tokens": 32768,
+            "qwen_mtp_repeated_proposals": True,
         }
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertEqual(ascend_config.eplb_config.num_redundant_experts, 2)
         self.assertTrue(ascend_config.multistream_overlap_shared_expert)
         self.assertEqual(ascend_config.mega_moe_max_tokens, 32768)
+        self.assertTrue(ascend_config.qwen_mtp_repeated_proposals)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertFalse(ascend_compilation_config.fuse_norm_quant)
@@ -146,6 +149,14 @@ class TestAscendConfig(TestBase):
 
         ascend_fusion_config = ascend_config.ascend_fusion_config
         self.assertFalse(ascend_fusion_config.fusion_ops_gmmswigluquant)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_repeat_proposal_config_rejects_non_boolean(self, mock_fix_incompatible_config):
+        config = VllmConfig()
+        config.additional_config = {"qwen_mtp_repeated_proposals": "true"}
+        with self.assertRaisesRegex(ValueError, "qwen_mtp_repeated_proposals must be a boolean"):
+            init_ascend_config(config)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

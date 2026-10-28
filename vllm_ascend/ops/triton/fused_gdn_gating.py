@@ -18,6 +18,8 @@ def fused_gdn_gating_kernel(
     a,
     b,
     dt_bias,
+    stride_a_batch,
+    stride_b_batch,
     seq_len,
     NUM_HEADS,
     NUM_BATCHES,
@@ -36,24 +38,30 @@ def fused_gdn_gating_kernel(
         for col_idx in range(0, COL_ITER):
             head_off = col_idx * BLK_HEADS + tl.arange(0, BLK_HEADS)
 
-            off = batch_off[:, None] * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off[None, :]
+            output_off = batch_off[:, None] * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off[None, :]
+            a_off = batch_off[:, None] * stride_a_batch + head_off[None, :]
+            b_off = batch_off[:, None] * stride_b_batch + head_off[None, :]
             head_mask = head_off < NUM_HEADS
             mask = head_mask[None, :] & (batch_off[:, None] < NUM_BATCHES)
 
             blk_A_log = tl.load(A_log + head_off, mask=head_mask)
-            blk_a = tl.load(a + off, mask=mask)
-            blk_b = tl.load(b + off, mask=mask)
+            blk_a = tl.load(a + a_off, mask=mask)
+            blk_b = tl.load(b + b_off, mask=mask)
             blk_bias = tl.load(dt_bias + head_off, mask=head_mask)
 
             x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)[None, :]
             softplus_x = tl.where(beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x)
 
             blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
-            tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+            tl.store(g + output_off, blk_g.to(g.dtype.element_ty), mask=mask)
 
             # compute beta_output = sigmoid(b)
             blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
-            tl.store(beta_output + off, blk_beta_output.to(beta_output.dtype.element_ty), mask=mask)
+            tl.store(
+                beta_output + output_off,
+                blk_beta_output.to(beta_output.dtype.element_ty),
+                mask=mask,
+            )
 
 
 def fused_gdn_gating_patch(
@@ -65,6 +73,8 @@ def fused_gdn_gating_patch(
     threshold: float = 20.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch, num_heads = a.shape
+    assert b.shape == a.shape
+    assert a.stride(1) == 1 and b.stride(1) == 1
     seq_len = 1
 
     num_cores = get_vectorcore_num()
@@ -87,6 +97,8 @@ def fused_gdn_gating_patch(
         a,
         b,
         dt_bias,
+        a.stride(0),
+        b.stride(0),
         seq_len,
         num_heads,
         batch,
